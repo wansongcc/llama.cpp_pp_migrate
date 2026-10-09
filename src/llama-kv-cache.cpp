@@ -79,12 +79,19 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+    const llama_layer_device_cb & layer_device,
+                     bool   independent_layers) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    independent_layers(independent_layers),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    if (independent_layers && (other || reuse || share || hparams.no_alloc)) {
+        throw std::runtime_error("independent KV cache layers do not support sharing, reuse, or no_alloc");
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -214,7 +221,10 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            auto * dev = layer_device ? layer_device(il) : model.dev_layer(il);
+            if (!dev) {
+                throw std::invalid_argument("invalid KV cache layer device");
+            }
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
@@ -222,7 +232,22 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
+        std::shared_ptr<layer_storage> storage;
+        ggml_context * ctx = nullptr;
+        if (independent_layers) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+
+            storage = std::make_shared<layer_storage>();
+            storage->ctx.reset(ggml_init(params));
+            storage->buft = buft;
+            ctx = storage->ctx.get();
+        } else {
+            ctx = ctx_for_buft(buft);
+        }
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
@@ -246,7 +271,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, storage, });
     }
 
     if (reuse) {
@@ -274,24 +299,36 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+    if (independent_layers) {
+        for (auto & layer : layers) {
+            auto & storage = *layer.storage;
+            storage.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(storage.ctx.get(), storage.buft));
+            if (!storage.buf) {
+                throw std::runtime_error("failed to allocate buffer for kv cache");
             }
-        } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(storage.buf.get()), ggml_backend_buffer_get_size(storage.buf.get())/1024.0/1024.0);
+            ggml_backend_buffer_clear(storage.buf.get(), 0);
         }
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for kv cache");
+    } else {
+        for (auto & [buft, ctx] : ctx_map) {
+            ggml_backend_buffer_t buf;
+            if (hparams.no_alloc) {
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+                }
+            } else {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            }
+            if (!buf) {
+                throw std::runtime_error("failed to allocate buffer for kv cache");
+            }
+
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+            ggml_backend_buffer_clear(buf, 0);
+            ctxs_bufs.emplace_back(std::move(ctx), buf);
         }
-
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-
-        ggml_backend_buffer_clear(buf, 0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
     {
@@ -366,6 +403,25 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+struct llama_kv_cache::layer_move final : llama_memory_layer_move {
+    layer_move(llama_kv_cache & mem, size_t i_layer, kv_layer && layer) :
+        mem(mem), i_layer(i_layer), layer(std::move(layer)) {
+    }
+
+    void swap() noexcept override {
+        auto & active = mem.layers[i_layer];
+        std::swap(active.k, layer.k);
+        std::swap(active.v, layer.v);
+        std::swap(active.k_stream, layer.k_stream);
+        std::swap(active.v_stream, layer.v_stream);
+        std::swap(active.storage, layer.storage);
+    }
+
+    llama_kv_cache & mem;
+    size_t i_layer;
+    kv_layer layer;
+};
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -373,8 +429,14 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
-        for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+        if (independent_layers) {
+            for (auto & layer : layers) {
+                ggml_backend_buffer_clear(layer.storage->buf.get(), 0);
+            }
+        } else {
+            for (auto & [_, buf] : ctxs_bufs) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
         }
     }
 }
@@ -684,6 +746,14 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
+    if (independent_layers) {
+        for (const auto & layer : layers) {
+            const auto & buf = layer.storage->buf;
+            ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+        return ret;
+    }
+
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
@@ -1186,6 +1256,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (independent_layers) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1239,6 +1312,85 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
+}
+
+std::vector<ggml_tensor *> llama_kv_cache::layer_state_tensors(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return {};
+    }
+
+    const auto & layer = layers[it->second];
+    std::vector<ggml_tensor *> result;
+    if (layer.k) {
+        result.push_back(layer.k);
+    }
+    if (layer.v) {
+        result.push_back(layer.v);
+    }
+    return result;
+}
+
+llama_memory_layer_move_ptr llama_kv_cache::prepare_layer_move(int32_t il, ggml_backend_dev_t dev) {
+    if (!independent_layers) {
+        throw std::runtime_error("KV cache layer moves require independent layers");
+    }
+    if (!dev) {
+        throw std::invalid_argument("invalid KV cache layer destination");
+    }
+
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        throw std::invalid_argument("invalid KV cache layer");
+    }
+
+    const size_t i_layer = it->second;
+    const auto & src = layers[i_layer];
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    kv_layer dst = { src.il, nullptr, nullptr, {}, {}, std::make_shared<layer_storage>(), };
+    dst.storage->ctx.reset(ggml_init(params));
+    dst.storage->buft = ggml_backend_dev_buffer_type(dev);
+    if (!dst.storage->ctx || !dst.storage->buft) {
+        throw std::runtime_error("failed to create KV cache layer destination");
+    }
+
+    auto * ctx = dst.storage->ctx.get();
+    dst.k = ggml_dup_tensor(ctx, src.k);
+    memcpy(dst.k->nb, src.k->nb, sizeof(dst.k->nb));
+    ggml_set_name(dst.k, ggml_get_name(src.k));
+
+    if (src.v) {
+        dst.v = ggml_dup_tensor(ctx, src.v);
+        memcpy(dst.v->nb, src.v->nb, sizeof(dst.v->nb));
+        ggml_set_name(dst.v, ggml_get_name(src.v));
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto * k_stream = src.k_stream[s];
+        dst.k_stream.push_back(ggml_view_2d(ctx, dst.k, k_stream->ne[0], k_stream->ne[1], k_stream->nb[1], k_stream->view_offs));
+        if (src.v) {
+            const auto * v_stream = src.v_stream[s];
+            dst.v_stream.push_back(ggml_view_2d(ctx, dst.v, v_stream->ne[0], v_stream->ne[1], v_stream->nb[1], v_stream->view_offs));
+        }
+    }
+
+    dst.storage->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, dst.storage->buft));
+    if (!dst.storage->buf) {
+        throw std::runtime_error("failed to allocate KV cache layer destination");
+    }
+
+    ggml_backend_tensor_copy(src.k, dst.k);
+    if (src.v) {
+        ggml_backend_tensor_copy(src.v, dst.v);
+    }
+
+    return std::make_unique<layer_move>(*this, i_layer, std::move(dst));
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
@@ -1885,6 +2037,13 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
 
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
+
+    if (independent_layers) {
+        for (const auto & layer : layers) {
+            size += ggml_backend_buffer_get_size(layer.storage->buf.get());
+        }
+        return size;
+    }
 
     for (const auto & [_, buf] : ctxs_bufs) {
         size += ggml_backend_buffer_get_size(buf.get());

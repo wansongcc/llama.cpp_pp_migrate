@@ -14,6 +14,8 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+using llama_layer_device_cb = std::function<ggml_backend_dev_t(int32_t)>;
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -25,6 +27,9 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    llama_layer_device_cb layer_device;
+    bool independent_layers = false;
 };
 
 enum llama_memory_status {
@@ -67,6 +72,14 @@ struct llama_memory_context_i {
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
+
+struct llama_memory_layer_move {
+    virtual ~llama_memory_layer_move() = default;
+
+    virtual void swap() noexcept = 0;
+};
+
+using llama_memory_layer_move_ptr = std::unique_ptr<llama_memory_layer_move>;
 
 // general concept of LLM memory
 // the KV cache is a type of LLM memory, but there can be other types

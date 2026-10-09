@@ -24,7 +24,9 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+        const llama_layer_device_cb & layer_device = nullptr,
+                         bool   independent_layers = false);
 
     ~llama_memory_recurrent() = default;
 
@@ -65,6 +67,9 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    llama_memory_layer_move_ptr prepare_layer_move(int32_t il, ggml_backend_dev_t dev);
+    std::vector<ggml_tensor *> layer_state_tensors(int32_t il) const;
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
@@ -115,6 +120,14 @@ public:
     std::vector<ggml_tensor *> p_l;
 
 private:
+    struct layer_storage {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_buffer_type_t buft = nullptr;
+    };
+
+    struct layer_move;
+
     //const llama_model & model;
     const llama_hparams & hparams;
 
@@ -122,6 +135,10 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    std::vector<std::shared_ptr<layer_storage>> layer_storages;
+
+    const bool independent_layers = false;
 
     size_t total_size() const;
 

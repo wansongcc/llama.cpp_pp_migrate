@@ -1336,6 +1336,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    layer_nodes.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1441,6 +1442,10 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
 }
 
+void llm_graph_result::add_layer_node(llm_graph_layer_node result) {
+    layer_nodes.push_back(result);
+}
+
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
@@ -1490,11 +1495,19 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    active_layers    (params.active_layers) {
         res->set_params(params);
     }
 
+const llama_layer & llm_graph_context::layer(const llama_model & model, int32_t il) const {
+    return active_layers ? *active_layers->at(il) : model.layers.at(il);
+}
+
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+    if (active_layers && il >= 0) {
+        res->add_layer_node({cur, il});
+    }
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }

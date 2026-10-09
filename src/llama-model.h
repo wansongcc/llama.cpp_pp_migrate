@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -607,6 +608,7 @@ struct llama_meta_device_get_split_state_userdata {
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
+    friend struct llama_model_context_guard;
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -740,6 +742,11 @@ struct llama_model {
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
+    void prepare_layer_replica(int32_t il, ggml_backend_dev_t dev);
+    const llama_layer & layer_on_device(int32_t il, ggml_backend_dev_t dev) const;
+    ggml_tensor * layer_tensor_on_device(int32_t il, ggml_backend_dev_t dev, ggml_tensor * tensor) const;
+    std::vector<ggml_backend_dev_t> layer_devices_available(int32_t il) const;
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
@@ -766,6 +773,9 @@ struct llama_model {
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:
+    virtual std::optional<llama_layer> remap_layer(
+            int32_t il, const std::unordered_map<const ggml_tensor *, ggml_tensor *> & tensors) const;
+
     llama_model_params params;
 
     struct impl;
@@ -774,6 +784,16 @@ protected:
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);
+
+struct llama_model_context_guard {
+    llama_model_context_guard(const llama_model & model, bool exclusive);
+    ~llama_model_context_guard();
+    llama_model_context_guard(const llama_model_context_guard &) = delete;
+    llama_model_context_guard & operator=(const llama_model_context_guard &) = delete;
+
+private:
+    const llama_model & model;
+};
 
 // model must inherit from this
 struct llama_model_base : public llama_model {

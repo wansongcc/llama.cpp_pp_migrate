@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -16,6 +17,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -82,8 +84,11 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+        const std::vector<ggml_backend_dev_t> & layer_devices) :
     model(model),
+    model_context_guard(std::make_unique<llama_model_context_guard>(model, !layer_devices.empty())),
+    layer_devices(layer_devices),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -95,6 +100,25 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    if (!layer_devices.empty()) {
+        if ((model.arch != LLM_ARCH_QWEN3NEXT && model.arch != LLM_ARCH_QWEN35MOE) || model.split_mode() != LLAMA_SPLIT_MODE_LAYER ||
+                model.has_tensor_overrides() || hparams.no_alloc || hparams.vocab_only ||
+                layer_devices.size() != hparams.n_layer() || params.n_seq_max != 1 || params.n_rs_seq != 0 ||
+                !params.offload_kqv || params.ctx_other || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            throw std::invalid_argument("experimental placement requires a single-sequence Qwen hybrid layer-split context");
+        }
+        for (size_t il = 0; il < layer_devices.size(); ++il) {
+            auto * dev = layer_devices[il];
+            if (!dev || std::none_of(model.devices.begin(), model.devices.end(),
+                    [dev](const llama_device & d) { return d.dev == dev; })) {
+                throw std::invalid_argument("placement device is not a model device");
+            }
+            active_layers.push_back(&model.layer_on_device(il, dev));
+        }
+        validate_layer_devices(layer_devices);
+        placement_epoch = 1;
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -390,7 +414,13 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.layer_device =*/ {},
+            /*.independent_layers =*/ false,
         };
+        if (!layer_devices.empty()) {
+            params_mem.layer_device = [this](int32_t il) { return get_layer_device(il); };
+            params_mem.independent_layers = true;
+        }
 
         memory.reset(model.create_memory(params_mem, cparams));
     }
@@ -459,6 +489,7 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+        validate_candidate_backends();
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -502,6 +533,251 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+ggml_backend_dev_t llama_context::get_layer_device(int32_t il) const {
+    return layer_devices.empty() ? model.dev_layer(il) : layer_devices.at(il);
+}
+
+void llama_context::validate_layer_devices(const std::vector<ggml_backend_dev_t> & devices) const {
+    size_t previous = 0;
+    for (auto * dev : devices) {
+        auto it = std::find_if(model.devices.begin(), model.devices.end(),
+                [dev](const llama_device & d) { return d.dev == dev; });
+        if (it == model.devices.end() || size_t(it - model.devices.begin()) < previous) {
+            throw std::invalid_argument("layer placement must preserve PP device order");
+        }
+        previous = it - model.devices.begin();
+    }
+}
+
+void llama_context::validate_layer_backends(const llm_graph_result & result) const {
+    if (layer_devices.empty()) {
+        return;
+    }
+    auto * graph = result.get_gf();
+    auto ** nodes = ggml_graph_nodes(graph);
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    std::vector<std::pair<int, int>> ranges(layer_devices.size(), {n_nodes, -1});
+    for (const auto & node : result.get_layer_nodes()) {
+        const auto it = std::find(nodes, nodes + n_nodes, node.tensor);
+        if (it == nodes + n_nodes) {
+            continue;
+        }
+        const int index = it - nodes;
+        auto & range = ranges.at(node.il);
+        range.first = std::min(range.first, index);
+        range.second = std::max(range.second, index);
+    }
+    int previous_end = -1;
+    for (size_t il = 0; il < ranges.size(); ++il) {
+        const auto range = ranges[il];
+        if (range.first > range.second || range.first <= previous_end) {
+            throw std::runtime_error(format("experimental layer %zu has no isolated graph range", il));
+        }
+        for (int i = range.first; i <= range.second; ++i) {
+            auto * tensor = nodes[i];
+            if (tensor->op == GGML_OP_NONE || tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW ||
+                    tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE) {
+                continue;
+            }
+            auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+            auto * actual = backend ? ggml_backend_get_device(backend) : nullptr;
+            auto * expected = get_layer_device(il);
+            if (actual != expected) {
+                throw std::runtime_error(format("experimental layer %zu node '%s' fell back from %s to %s", il,
+                        ggml_get_name(tensor), ggml_backend_dev_name(expected), actual ? ggml_backend_dev_name(actual) : "none"));
+            }
+        }
+        previous_end = range.second;
+    }
+}
+
+void llama_context::validate_candidate_backends() {
+    auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (layer_devices.empty() || !mem) {
+        return;
+    }
+
+    const auto available = [&](int32_t il, ggml_backend_dev_t dev) {
+        const auto devices = model.layer_devices_available(il);
+        return std::find(devices.begin(), devices.end(), dev) != devices.end();
+    };
+
+    validated_layer_placements = {layer_devices};
+    std::vector<std::vector<ggml_backend_dev_t>> candidates;
+    for (size_t run_first = 0; run_first < layer_devices.size();) {
+        size_t run_end = run_first + 1;
+        while (run_end < layer_devices.size() && layer_devices[run_end] == layer_devices[run_first]) {
+            ++run_end;
+        }
+
+        const auto dev_it = std::find_if(model.devices.begin(), model.devices.end(),
+                [&](const llama_device & d) { return d.dev == layer_devices[run_first]; });
+        const size_t dev_index = dev_it - model.devices.begin();
+        if (dev_index + 1 < model.devices.size()) {
+            auto forward = layer_devices;
+            auto * destination = model.devices[dev_index + 1].dev;
+            for (size_t first = run_end; first > run_first && available(first - 1, destination);) {
+                forward[--first] = destination;
+                candidates.push_back(forward);
+            }
+        }
+        if (dev_index > 0) {
+            auto reverse = layer_devices;
+            auto * destination = model.devices[dev_index - 1].dev;
+            for (size_t end = run_first; end < run_end && available(end, destination); ++end) {
+                reverse[end] = destination;
+                candidates.push_back(reverse);
+            }
+        }
+        run_first = run_end;
+    }
+
+    for (const auto & candidate : candidates) {
+        std::vector<const llama_layer *> candidate_layers = active_layers;
+        std::vector<llama_memory_layer_move_ptr> moves;
+        for (size_t il = 0; il < candidate.size(); ++il) {
+            if (candidate[il] == layer_devices[il]) {
+                continue;
+            }
+            candidate_layers[il] = &model.layer_on_device(il, candidate[il]);
+            moves.push_back(mem->prepare_layer_move(il, candidate[il]));
+        }
+
+        const auto saved_cparams = cparams;
+        const auto saved_epoch = placement_epoch;
+
+        ggml_backend_sched_reset(sched.get());
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+        for (auto & move : moves) {
+            move->swap();
+        }
+        auto original_devices = layer_devices;
+        auto original_layers = active_layers;
+        layer_devices = candidate;
+        active_layers = std::move(candidate_layers);
+        ++placement_epoch;
+        try {
+            sched_need_reserve = true;
+            sched_reserve();
+        } catch (...) {
+            const auto failure = std::current_exception();
+            ggml_backend_sched_reset(sched.get());
+            gf_res_prev->reset();
+            gf_res_reserve->reset();
+            for (auto & move : moves) {
+                move->swap();
+            }
+            layer_devices = std::move(original_devices);
+            active_layers = std::move(original_layers);
+            placement_epoch = saved_epoch;
+            cparams = saved_cparams;
+            moves.clear();
+            sched_need_reserve = true;
+            sched_reserve();
+            std::rethrow_exception(failure);
+        }
+
+        ggml_backend_sched_reset(sched.get());
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+        for (auto & move : moves) {
+            move->swap();
+        }
+        layer_devices = std::move(original_devices);
+        active_layers = std::move(original_layers);
+        placement_epoch = saved_epoch;
+        cparams = saved_cparams;
+        moves.clear();
+        sched_need_reserve = true;
+        sched_reserve();
+        validated_layer_placements.push_back(candidate);
+    }
+}
+
+void llama_context::migrate_layers_sync(
+        int32_t first, int32_t end, ggml_backend_dev_t destination, bool fail_after_switch) {
+    if (layer_devices.empty() || first < 0 || first >= end || size_t(end) > layer_devices.size()) {
+        throw std::invalid_argument("invalid experimental layer migration interval");
+    }
+    if (opt_ctx || !sampling.samplers.empty() || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+            cparams.embeddings_nextn || cparams.n_rs_seq != 0) {
+        throw std::invalid_argument("layer migration requires ordinary host-sampled inference");
+    }
+    auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem) {
+        throw std::runtime_error("layer migration requires hybrid memory");
+    }
+    if (!mem->is_append_only()) {
+        throw std::invalid_argument("layer migration requires append-only state");
+    }
+    const auto source = layer_devices[first];
+    auto next_devices = layer_devices;
+    auto next_layers = active_layers;
+    for (int32_t il = first; il < end; ++il) {
+        if (layer_devices[il] != source || source == destination) {
+            throw std::invalid_argument("migration must move a single PP stage interval to another device");
+        }
+        next_devices[il] = destination;
+        next_layers[il] = &model.layer_on_device(il, destination);
+    }
+    validate_layer_devices(next_devices);
+    const auto device_index = [&](ggml_backend_dev_t dev) {
+        return std::find_if(model.devices.begin(), model.devices.end(),
+                [dev](const llama_device & d) { return d.dev == dev; }) - model.devices.begin();
+    };
+    if (std::abs(device_index(source) - device_index(destination)) != 1) {
+        throw std::invalid_argument("migration destination must be an adjacent PP device");
+    }
+    if (std::find(validated_layer_placements.begin(), validated_layer_placements.end(), next_devices) ==
+            validated_layer_placements.end()) {
+        throw std::invalid_argument("migration layout was not validated before generation");
+    }
+
+    const auto previous_cparams = cparams;
+    synchronize();
+    std::vector<llama_memory_layer_move_ptr> moves;
+    for (int32_t il = first; il < end; ++il) {
+        moves.push_back(mem->prepare_layer_move(il, destination));
+    }
+
+    // Keep the old allocations alive until all graphs have dropped their references.
+    ggml_backend_sched_reset(sched.get());
+    gf_res_prev->reset();
+    gf_res_reserve->reset();
+    for (auto & move : moves) {
+        move->swap();
+    }
+    layer_devices.swap(next_devices);
+    active_layers.swap(next_layers);
+    const auto previous_epoch = placement_epoch++;
+    try {
+        if (fail_after_switch) {
+            throw std::runtime_error("injected migration failure after placement switch");
+        }
+        sched_need_reserve = true;
+        sched_reserve();
+    } catch (...) {
+        const auto failure = std::current_exception();
+        ggml_backend_sched_reset(sched.get());
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+        for (auto & move : moves) {
+            move->swap();
+        }
+        layer_devices.swap(next_devices);
+        active_layers.swap(next_layers);
+        placement_epoch = previous_epoch;
+        cparams = previous_cparams;
+        moves.clear();
+        sched_need_reserve = true;
+        sched_reserve();
+        std::rethrow_exception(failure);
+    }
+    LLAMA_LOG_INFO("%s: layers [%d, %d) moved from %s to %s, epoch %" PRIu64 "\n", __func__,
+            first, end, ggml_backend_dev_name(source), ggml_backend_dev_name(destination), placement_epoch);
+}
+
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
@@ -529,7 +805,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
             // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            ggml_backend_dev_t device_layer = get_layer_device(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -1220,6 +1496,11 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return true;
     }
 
+    if (sampler && !layer_devices.empty()) {
+        LLAMA_LOG_ERROR("%s: backend sampling is disabled with experimental layer placement\n", __func__);
+        return false;
+    }
+
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
@@ -1272,11 +1553,19 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
-void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
+bool llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
-        return;
+        return true;
+    }
+    if (!layer_devices.empty()) {
+        for (size_t i = 0; i < n_adapters; ++i) {
+            if (scales[i] != 0.0f) {
+                LLAMA_LOG_ERROR("%s: runtime adapters are disabled with experimental layer placement\n", __func__);
+                return false;
+            }
+        }
     }
 
     loras.reset(new llama_adapter_loras());
@@ -1288,6 +1577,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     }
 
     sched_need_reserve = true;
+    return true;
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -1323,6 +1613,11 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_start,
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
+
+    if (!layer_devices.empty() && data != nullptr) {
+        LLAMA_LOG_ERROR("%s: runtime control vectors are disabled with experimental layer placement\n", __func__);
+        return false;
+    }
 
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
@@ -2455,10 +2750,21 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
+    } else {
+        if (!layer_devices.empty()) {
+            auto validation = std::make_unique<llm_graph_result>(res->get_max_nodes());
+            auto validation_params = gparams;
+            validation_params.res = validation.get();
+            model.build_graph(validation_params);
+            ggml_backend_sched_split_graph(sched.get(), validation->get_gf());
+            validate_layer_backends(*validation);
+            ggml_backend_sched_reset(sched.get());
+        }
+        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            GGML_ASSERT(!sizes);
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
 
     return gf;
@@ -2485,6 +2791,8 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.active_layers =*/ active_layers.empty() ? nullptr : &active_layers,
+        /*.placement_epoch =*/ placement_epoch,
     };
 }
 
@@ -2531,7 +2839,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
-                const auto & dev_layer = model.dev_layer(il);
+                const auto dev_layer = get_layer_device(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
@@ -3992,9 +4300,7 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
-    ctx->set_adapters_lora(adapters, n_adapters, scales);
-
-    return 0;
+    return ctx->set_adapters_lora(adapters, n_adapters, scales) ? 0 : -1;
 }
 
 int32_t llama_set_adapter_cvec(

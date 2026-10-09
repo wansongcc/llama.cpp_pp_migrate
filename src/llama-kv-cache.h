@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        const llama_layer_device_cb & layer_device = nullptr,
+                         bool   independent_layers = false);
 
     ~llama_kv_cache() = default;
 
@@ -165,6 +167,9 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+
+    llama_memory_layer_move_ptr prepare_layer_move(int32_t il, ggml_backend_dev_t dev);
+    std::vector<ggml_tensor *> layer_state_tensors(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -244,6 +249,12 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+    struct layer_storage {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_buffer_type_t buft = nullptr;
+    };
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -257,7 +268,11 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        std::shared_ptr<layer_storage> storage;
     };
+
+    struct layer_move;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -290,6 +305,8 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    const bool independent_layers = false;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

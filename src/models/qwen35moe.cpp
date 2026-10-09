@@ -146,6 +146,80 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+std::optional<llama_layer> llama_model_qwen35moe::remap_layer(
+        int32_t il, const std::unordered_map<const ggml_tensor *, ggml_tensor *> & tensors) const {
+    const auto & src = layers.at(il);
+    llama_layer dst{};
+    static ggml_tensor * llama_layer::* const fields[] = {
+        &llama_layer::attn_norm,
+        &llama_layer::attn_post_norm,
+        &llama_layer::attn_q_norm,
+        &llama_layer::attn_k_norm,
+        &llama_layer::wq,
+        &llama_layer::wk,
+        &llama_layer::wv,
+        &llama_layer::wo,
+        &llama_layer::wqkv,
+        &llama_layer::wqkv_gate,
+        &llama_layer::wq_b,
+        &llama_layer::wk_b,
+        &llama_layer::wv_b,
+        &llama_layer::wqkv_b,
+        &llama_layer::ssm_conv1d,
+        &llama_layer::ssm_dt,
+        &llama_layer::ssm_a,
+        &llama_layer::ssm_beta,
+        &llama_layer::ssm_alpha,
+        &llama_layer::ssm_norm,
+        &llama_layer::ssm_out,
+        &llama_layer::ffn_gate_inp,
+        &llama_layer::ffn_gate_up_exps,
+        &llama_layer::ffn_up_exps,
+        &llama_layer::ffn_gate_exps,
+        &llama_layer::ffn_down_exps,
+        &llama_layer::ffn_gate_inp_shexp,
+        &llama_layer::ffn_gate_shexp,
+        &llama_layer::ffn_up_shexp,
+        &llama_layer::ffn_down_shexp,
+        &llama_layer::wq_s,
+        &llama_layer::wk_s,
+        &llama_layer::wv_s,
+        &llama_layer::wo_s,
+        &llama_layer::wqkv_s,
+        &llama_layer::wqkv_gate_s,
+        &llama_layer::ffn_up_exps_s,
+        &llama_layer::ffn_gate_exps_s,
+        &llama_layer::ffn_down_exps_s,
+        &llama_layer::ffn_gate_shexp_s,
+        &llama_layer::ffn_up_shexp_s,
+        &llama_layer::ffn_down_shexp_s,
+        &llama_layer::ssm_out_s,
+        &llama_layer::ssm_alpha_s,
+        &llama_layer::ssm_beta_s,
+        &llama_layer::wq_in_s,
+        &llama_layer::wk_in_s,
+        &llama_layer::wv_in_s,
+        &llama_layer::wo_in_s,
+        &llama_layer::wqkv_in_s,
+        &llama_layer::wqkv_gate_in_s,
+        &llama_layer::ffn_gate_exps_in_s,
+        &llama_layer::ffn_up_exps_in_s,
+        &llama_layer::ffn_down_exps_in_s,
+        &llama_layer::ffn_gate_shexp_in_s,
+        &llama_layer::ffn_up_shexp_in_s,
+        &llama_layer::ffn_down_shexp_in_s,
+        &llama_layer::ssm_out_in_s,
+        &llama_layer::ssm_alpha_in_s,
+        &llama_layer::ssm_beta_in_s,
+    };
+    for (auto field : fields) {
+        if (src.*field) {
+            dst.*field = tensors.at(src.*field);
+        }
+    }
+    return dst;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_qwen35moe::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
@@ -180,7 +254,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         ggml_tensor * inpSA = inpL;
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = build_norm(inpL, layer(model, il).attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         ggml_build_forward_expand(gf, cur);
@@ -207,7 +281,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * ffn_residual = cur;
 
         // Post-attention norm
-        ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        ggml_tensor * attn_post_norm = build_norm(cur, layer(model, il).attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
         // MOE FFN layer
@@ -254,11 +328,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_tensor * qkv_mixed = build_lora_mm(layer(model, il).wqkv, input, layer(model, il).wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_tensor * z = build_lora_mm(layer(model, il).wqkv_gate, input, layer(model, il).wqkv_gate_s);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -287,7 +361,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_tensor * Qcur_full = build_lora_mm(layer(model, il).wq, cur, layer(model, il).wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
@@ -296,18 +370,18 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
-    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    Qcur = build_norm(Qcur, layer(model, il).attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
 
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    ggml_tensor * Kcur = build_lora_mm(layer(model, il).wk, cur, layer(model, il).wk_s);
     cb(Kcur, "Kcur", il);
 
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    ggml_tensor * Vcur = build_lora_mm(layer(model, il).wv, cur, layer(model, il).wv_s);
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    Kcur = build_norm(Kcur, layer(model, il).attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
@@ -350,7 +424,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
 
-    cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+    cur = build_lora_mm(layer(model, il).wo, cur, layer(model, il).wo_s);
     cb(cur, "attn_output", il);
 
     return cur;
@@ -379,22 +453,22 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta = build_lora_mm(layer(model, il).ssm_beta, cur, layer(model, il).ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    ggml_tensor * alpha = build_lora_mm(layer(model, il).ssm_alpha, cur, layer(model, il).ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, layer(model, il).ssm_dt);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, layer(model, il).ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
@@ -402,7 +476,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 
-    ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
+    ggml_tensor * conv_kernel      = layer(model, il).ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
@@ -474,14 +548,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // Apply gated normalization: self.norm(core_attn_out, z)
-    ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    ggml_tensor * attn_out_norm = build_norm_gated(output, layer(model, il).ssm_norm, z_2d, il);
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
     ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
-    cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    cur = build_lora_mm(layer(model, il).ssm_out, final_output, layer(model, il).ssm_out_s);
     cb(cur, "linear_attn_out", il);
 
     // Reshape back to original dimensions
@@ -492,32 +566,32 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Check if this is an MoE layer
-    GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+    GGML_ASSERT(layer(model, il).ffn_gate_inp != nullptr);
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            layer(model, il).ffn_gate_inp,
+            layer(model, il).ffn_up_exps,
+            layer(model, il).ffn_gate_exps,
+            layer(model, il).ffn_down_exps,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            nullptr, layer(model, il).ffn_gate_up_exps,
+            layer(model, il).ffn_up_exps_s,
+            layer(model, il).ffn_gate_exps_s,
+            layer(model, il).ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
-    if (model.layers[il].ffn_up_shexp != nullptr) {
+    if (layer(model, il).ffn_up_shexp != nullptr) {
         ggml_tensor * ffn_shexp =
             build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                layer(model, il).ffn_up_shexp, NULL, layer(model, il).ffn_up_shexp_s,
+                layer(model, il).ffn_gate_shexp, NULL, layer(model, il).ffn_gate_shexp_s,
+                layer(model, il).ffn_down_shexp, NULL, layer(model, il).ffn_down_shexp_s,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(ffn_shexp, "ffn_shexp", il);
@@ -525,7 +599,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         // Apply shared expert gating as in the reference implementation
         // The shared expert has its own gate that is sigmoided
         // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        ggml_tensor * shared_gate = build_lora_mm(layer(model, il).ffn_gate_inp_shexp, cur);
         cb(shared_gate, "shared_expert_gate", il);
 
         // Apply sigmoid to the gate

@@ -4,6 +4,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <stdexcept>
+
 //
 // llama_memory_hybrid
 //
@@ -29,7 +31,9 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+    const llama_layer_device_cb & layer_device,
+                     bool   independent_layers) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -49,7 +53,10 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        layer_device,
+        independent_layers
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -61,8 +68,11 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
-    )) {}
+            : filter_recr,
+        layer_device,
+        independent_layers
+    )),
+    independent_layers(independent_layers) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -138,6 +148,7 @@ bool llama_memory_hybrid::get_can_shift() const {
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
+    append_only = true;
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -146,27 +157,32 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+    append_only = false;
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    append_only = false;
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
+    append_only = false;
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
+    append_only = false;
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
+    append_only = false;
 }
 
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
@@ -199,6 +215,25 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_attn->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
+    append_only = false;
+}
+
+bool llama_memory_hybrid::is_append_only() const {
+    return !independent_layers || append_only;
+}
+
+std::vector<ggml_tensor *> llama_memory_hybrid::layer_state_tensors(int32_t il) const {
+    if (il < 0 || (uint32_t) il >= hparams.n_layer()) {
+        return {};
+    }
+    return hparams.is_recr(il) ? mem_recr->layer_state_tensors(il) : mem_attn->layer_state_tensors(il);
+}
+
+llama_memory_layer_move_ptr llama_memory_hybrid::prepare_layer_move(int32_t il, ggml_backend_dev_t dev) {
+    if (il < 0 || (uint32_t) il >= hparams.n_layer() || !dev) {
+        throw std::invalid_argument("invalid hybrid cache layer destination");
+    }
+    return hparams.is_recr(il) ? mem_recr->prepare_layer_move(il, dev) : mem_attn->prepare_layer_move(il, dev);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

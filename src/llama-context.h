@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_model_context_guard;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -43,7 +44,8 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+            const std::vector<ggml_backend_dev_t> & layer_devices = {});
 
     ~llama_context();
 
@@ -59,6 +61,11 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
+
+    ggml_backend_dev_t get_layer_device(int32_t il) const;
+
+    // Synchronous reference for the experimental layer migration path.
+    void migrate_layers_sync(int32_t first, int32_t end, ggml_backend_dev_t destination, bool fail_after_switch = false);
 
     ggml_backend_sched_t get_sched() const;
 
@@ -119,7 +126,7 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
-    void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+    bool set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -254,6 +261,10 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    void validate_layer_devices(const std::vector<ggml_backend_dev_t> & devices) const;
+    void validate_layer_backends(const llm_graph_result & result) const;
+    void validate_candidate_backends();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -278,6 +289,12 @@ private:
     //
 
     const llama_model & model;
+    std::unique_ptr<llama_model_context_guard> model_context_guard;
+
+    std::vector<ggml_backend_dev_t> layer_devices;
+    std::vector<std::vector<ggml_backend_dev_t>> validated_layer_placements;
+    std::vector<const llama_layer *> active_layers;
+    uint64_t placement_epoch = 0;
 
     llama_cparams cparams;
 

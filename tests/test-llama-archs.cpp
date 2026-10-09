@@ -9,13 +9,20 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-adapter.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
+#include "../src/llama-context.h"
+#include "../src/llama-memory-hybrid.h"
 
 #include <cinttypes>
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -65,7 +72,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [--pp-replicas] [--pp-rpc endpoint-a endpoint-b] [--pp-model path] [--pp-low-vram] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -788,6 +795,702 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     return all_ok ? 0 : 1;
 }
 
+static std::vector<float> pp_decode_tokens(
+        llama_context & ctx, const std::vector<llama_token> & tokens, llama_pos pos = 0,
+        std::vector<int64_t> * elapsed_us = nullptr) {
+    std::vector<float> result;
+    auto batch = llama_batch_init(1, 0, 1);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.n_tokens = 1;
+        batch.token[0] = tokens[i];
+        batch.pos[0] = pos + i;
+        batch.n_seq_id[0] = 1;
+        batch.seq_id[0][0] = 0;
+        batch.logits[0] = true;
+        const int64_t start_us = ggml_time_us();
+        if (llama_decode(&ctx, batch) != 0) {
+            llama_batch_free(batch);
+            throw std::runtime_error("PP fixture decode failed");
+        }
+        const auto * logits = llama_get_logits_ith(&ctx, 0);
+        if (elapsed_us) {
+            elapsed_us->push_back(ggml_time_us() - start_us);
+        }
+        const auto n_vocab = ctx.get_model().vocab.n_tokens();
+        for (uint32_t j = 0; j < n_vocab; ++j) {
+            if (!std::isfinite(logits[j])) {
+                llama_batch_free(batch);
+                throw std::runtime_error("PP fixture produced nonfinite logits");
+            }
+        }
+        result.insert(result.end(), logits, logits + n_vocab);
+    }
+    llama_batch_free(batch);
+    return result;
+}
+
+static void pp_append(std::vector<float> & dst, std::vector<float> src) {
+    dst.insert(dst.end(), src.begin(), src.end());
+}
+
+static std::pair<double, double> pp_compare_logits(
+        const std::vector<float> & expected, const std::vector<float> & actual,
+        double abs_tol = 1e-4, double rel_tol = 1e-4) {
+    if (expected.size() != actual.size()) {
+        throw std::runtime_error("PP logit result size changed");
+    }
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const double diff = std::abs(double(expected[i]) - double(actual[i]));
+        const double rel = diff/std::max(std::abs(double(expected[i])), 1e-12);
+        max_abs = std::max(max_abs, diff);
+        max_rel = std::max(max_rel, rel);
+        if (!std::isfinite(actual[i]) || diff > abs_tol + rel_tol*std::abs(double(expected[i]))) {
+            throw std::runtime_error("PP layer migration changed logits beyond tolerance");
+        }
+    }
+    return {max_abs, max_rel};
+}
+
+struct pp_timing_summary {
+    int64_t minimum;
+    int64_t median;
+    int64_t p95;
+};
+
+static pp_timing_summary pp_summarize(std::vector<int64_t> values) {
+    if (values.empty()) {
+        throw std::invalid_argument("cannot summarize empty timings");
+    }
+    std::sort(values.begin(), values.end());
+    const size_t p95 = std::min(values.size() - 1, size_t(std::ceil(0.95*values.size())) - 1);
+    return {values.front(), values[values.size()/2], values[p95]};
+}
+
+static std::vector<std::vector<uint8_t>> pp_layer_state_bytes(
+        const llama_memory_hybrid & memory, int32_t first, int32_t end) {
+    std::vector<std::vector<uint8_t>> result;
+    for (int32_t il = first; il < end; ++il) {
+        for (auto * tensor : memory.layer_state_tensors(il)) {
+            result.emplace_back(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, result.back().data(), 0, result.back().size());
+        }
+    }
+    return result;
+}
+
+static size_t pp_device_memory(
+        const std::map<ggml_backend_buffer_type_t, size_t> & breakdown, ggml_backend_dev_t device) {
+    size_t result = 0;
+    for (const auto & entry : breakdown) {
+        if (ggml_backend_buft_get_device(entry.first) == device) {
+            result += entry.second;
+        }
+    }
+    return result;
+}
+
+static int test_layer_replicas(size_t seed, const std::vector<std::string> & rpc_endpoints) {
+    std::vector<ggml_backend_dev_t> devices;
+    if (!rpc_endpoints.empty()) {
+        auto * rpc = ggml_backend_reg_by_name("RPC");
+        using add_server_t = ggml_backend_reg_t (*)(const char *);
+        auto add_server = rpc ? (add_server_t) ggml_backend_reg_get_proc_address(rpc, "ggml_backend_rpc_add_server") : nullptr;
+        if (!add_server) {
+            fprintf(stderr, "SKIP: RPC backend is unavailable\n");
+            return 77;
+        }
+        for (const auto & endpoint : rpc_endpoints) {
+            auto * reg = add_server(endpoint.c_str());
+            if (!reg || ggml_backend_reg_dev_count(reg) == 0) {
+                throw std::runtime_error("RPC endpoint has no device");
+            }
+            devices.push_back(ggml_backend_reg_dev_get(reg, 0));
+        }
+    }
+    for (size_t i = 0; rpc_endpoints.empty() && i < ggml_backend_dev_count() && devices.size() < 2; ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.size() < 2) {
+        fprintf(stderr, "SKIP: PP replica test requires two GPU devices\n");
+        return 77;
+    }
+
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN3NEXT, true);
+    gguf_set_val_u32(metadata.get(), "qwen3next.block_count", 4);
+    auto params = llama_model_default_params();
+    std::vector<ggml_backend_dev_t> terminated_devices = devices;
+    terminated_devices.push_back(nullptr);
+    params.devices = terminated_devices.data();
+    const float tensor_split[] = {1.0f, 0.0f};
+    params.tensor_split = tensor_split;
+    params.n_gpu_layers = 999;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, params));
+    if (!model) {
+        throw std::runtime_error("could not create PP replica fixture");
+    }
+
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        auto * source = model->dev_layer(il);
+        auto * target = source == devices[0] ? devices[1] : devices[0];
+        model->prepare_layer_replica(il, target);
+        const auto & replica = model->layer_on_device(il, target);
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        size_t n_checked = 0;
+        bool checked_experts = false;
+        for (const auto & entry : model->tensors_by_name) {
+            if (entry.first.compare(0, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            auto * original = entry.second;
+            auto * copied = model->layer_tensor_on_device(il, target, original);
+            if (copied == original || copied->type != original->type ||
+                    !ggml_are_same_shape(original, copied) || !ggml_are_same_stride(original, copied)) {
+                throw std::runtime_error("replica must have separate storage and the original layout");
+            }
+            auto * buft = ggml_backend_buffer_get_type(copied->buffer);
+            if (ggml_backend_buft_get_device(buft) != target) {
+                throw std::runtime_error("replica is on the wrong device");
+            }
+            std::vector<uint8_t> expected(ggml_nbytes(original));
+            std::vector<uint8_t> actual(expected.size());
+            ggml_backend_tensor_get(original, expected.data(), 0, expected.size());
+            ggml_backend_tensor_get(copied, actual.data(), 0, actual.size());
+            if (actual != expected) {
+                throw std::runtime_error("replica changed weight bytes");
+            }
+            if (original == model->layers[il].ffn_down_exps) {
+                if (replica.ffn_down_exps != copied) {
+                    throw std::runtime_error("expert field still references the source weights");
+                }
+                checked_experts = true;
+            }
+            ++n_checked;
+        }
+        if (n_checked == 0 || !checked_experts) {
+            throw std::runtime_error("PP replica fixture did not exercise expert weights");
+        }
+        const auto sizes = model->memory_breakdown();
+        model->prepare_layer_replica(il, target);
+        if (&replica != &model->layer_on_device(il, target) || sizes != model->memory_breakdown()) {
+            throw std::runtime_error("preparing an existing replica allocated another copy");
+        }
+        if (model->dev_layer(il) != source) {
+            throw std::runtime_error("preparing a replica changed the model's default placement");
+        }
+        printf("PP replica layer %u: %zu tensors checked on %s\n", il, n_checked, ggml_backend_dev_name(target));
+    }
+
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx = 64;
+    cparams.n_batch = 16;
+    cparams.n_ubatch = 16;
+    cparams.n_threads = 4;
+    cparams.n_threads_batch = 4;
+    cparams.no_perf = false;
+    const auto tokens = get_tokens(16, model->vocab.n_tokens(), seed);
+    std::vector<float> expected;
+    {
+        llama_context ctx(*model, cparams);
+        expected = pp_decode_tokens(ctx, tokens);
+    }
+    std::vector<ggml_backend_dev_t> placement;
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        placement.push_back(model->dev_layer(il) == devices[0] ? devices[1] : devices[0]);
+    }
+    auto run_placement = [&]() {
+        llama_context ctx(*model, cparams, placement);
+        llama_adapter_lora adapter(model.get());
+        llama_adapter_lora * adapters[] = {&adapter};
+        float scales[] = {1.0f};
+        if (ctx.set_adapters_lora(adapters, 1, scales)) {
+            throw std::runtime_error("experimental placement allowed a runtime LoRA adapter");
+        }
+        std::vector<float> cvec((model->hparams.n_layer() - 1)*model->hparams.n_embd, 0.25f);
+        if (ctx.set_adapter_cvec(cvec.data(), cvec.size(), model->hparams.n_embd, 1, model->hparams.n_layer())) {
+            throw std::runtime_error("experimental placement allowed a runtime control vector");
+        }
+        if (llama_memory_can_shift(ctx.get_memory())) {
+            throw std::runtime_error("experimental placement allowed context shift");
+        }
+        llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+        if (ctx.set_sampler(0, sampler.get())) {
+            throw std::runtime_error("experimental placement allowed backend sampling");
+        }
+        bool context_rejected = false;
+        try {
+            llama_context other(*model, cparams);
+        } catch (const std::runtime_error &) {
+            context_rejected = true;
+        }
+        if (!context_rejected) {
+            throw std::runtime_error("experimental placement allowed a second active context");
+        }
+        bool preparation_rejected = false;
+        try {
+            model->prepare_layer_replica(0, placement[0]);
+        } catch (const std::runtime_error &) {
+            preparation_rejected = true;
+        }
+        if (!preparation_rejected) {
+            throw std::runtime_error("weight replica preparation was allowed with an active context");
+        }
+        auto * mem = dynamic_cast<llama_memory_hybrid *>(ctx.get_memory());
+        if (!mem) {
+            throw std::runtime_error("PP fixture requires hybrid memory");
+        }
+        for (size_t il = 0; il < placement.size(); ++il) {
+            for (auto * tensor : mem->layer_state_tensors(il)) {
+                if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) != placement[il]) {
+                    throw std::runtime_error("state does not follow context placement");
+                }
+            }
+        }
+        return pp_decode_tokens(ctx, tokens);
+    };
+    if (run_placement() != expected) {
+        throw std::runtime_error("initial placement changed inference results");
+    }
+    const int32_t intervals[][3] = {{1, 2, 1}, {2, 3, 0}, {0, 2, 1}, {2, 4, 0}};
+    for (const auto & interval : intervals) {
+        const int32_t first = interval[0];
+        const int32_t end = interval[1];
+        const auto target = devices[interval[2]];
+        const std::vector<ggml_backend_dev_t> original = {devices[0], devices[0], devices[1], devices[1]};
+        llama_context ctx(*model, cparams, original);
+        auto result = pp_decode_tokens(ctx, {tokens.begin(), tokens.begin() + 6});
+        auto * mem = dynamic_cast<llama_memory_hybrid *>(ctx.get_memory());
+        std::vector<std::vector<ggml_tensor *>> state_tensors_before;
+        for (size_t il = 0; il < original.size(); ++il) {
+            state_tensors_before.push_back(mem->layer_state_tensors(il));
+        }
+        const auto state_allocation_size = [](const std::map<ggml_backend_buffer_type_t, size_t> & sizes) {
+            size_t result = 0;
+            for (const auto & entry : sizes) {
+                result += entry.second;
+            }
+            return result;
+        };
+        const size_t allocation_size_before = state_allocation_size(mem->memory_breakdown());
+
+        bool invalid_rejected = false;
+        try {
+            ctx.migrate_layers_sync(first, end, original[first]);
+        } catch (const std::invalid_argument &) {
+            invalid_rejected = true;
+        }
+        if (!invalid_rejected) {
+            throw std::runtime_error("same-device migration was not rejected");
+        }
+        invalid_rejected = false;
+        try {
+            ctx.migrate_layers_sync(1, 3, devices[1]);
+        } catch (const std::invalid_argument &) {
+            invalid_rejected = true;
+        }
+        if (!invalid_rejected) {
+            throw std::runtime_error("multi-stage migration interval was not rejected");
+        }
+        for (size_t il = 0; il < original.size(); ++il) {
+            if (ctx.get_layer_device(il) != original[il] || mem->layer_state_tensors(il) != state_tensors_before[il]) {
+                throw std::runtime_error("rejected migration changed active placement or state");
+            }
+        }
+
+        std::vector<uint8_t> state_before(llama_state_seq_get_size(&ctx, 0));
+        llama_state_seq_get_data(&ctx, state_before.data(), state_before.size(), 0);
+        std::vector<std::vector<uint8_t>> state_bytes;
+        for (int32_t il = first; il < end; ++il) {
+            for (auto * tensor : mem->layer_state_tensors(il)) {
+                state_bytes.emplace_back(ggml_nbytes(tensor));
+                ggml_backend_tensor_get(tensor, state_bytes.back().data(), 0, state_bytes.back().size());
+            }
+        }
+        ctx.migrate_layers_sync(first, end, target);
+        if (state_allocation_size(mem->memory_breakdown()) != allocation_size_before) {
+            throw std::runtime_error("synchronous move retained an active source state allocation");
+        }
+        size_t ti = 0;
+        for (size_t il = 0; il < original.size(); ++il) {
+            const auto state_tensors_after = mem->layer_state_tensors(il);
+            if ((il >= (size_t) first && il < (size_t) end) == (state_tensors_after == state_tensors_before[il])) {
+                throw std::runtime_error("synchronous move replaced the wrong layer state");
+            }
+            for (auto * tensor : state_tensors_after) {
+                if (il >= (size_t) first && il < (size_t) end) {
+                    std::vector<uint8_t> actual(ggml_nbytes(tensor));
+                    ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+                    if (actual != state_bytes.at(ti++)) {
+                        throw std::runtime_error("synchronous move changed state bytes");
+                    }
+                }
+                const auto expected_device = il >= (size_t) first && il < (size_t) end ? target : original[il];
+                if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) != expected_device) {
+                    throw std::runtime_error("synchronous move used the wrong state device");
+                }
+            }
+        }
+        std::vector<uint8_t> state_after(llama_state_seq_get_size(&ctx, 0));
+        llama_state_seq_get_data(&ctx, state_after.data(), state_after.size(), 0);
+        if (state_before != state_after) {
+            throw std::runtime_error("synchronous move changed valid sequence state or metadata");
+        }
+        auto middle = pp_decode_tokens(ctx, {tokens.begin() + 6, tokens.begin() + 11}, 6);
+        result.insert(result.end(), middle.begin(), middle.end());
+        ctx.migrate_layers_sync(first, end, original[first]);
+        if (state_allocation_size(mem->memory_breakdown()) != allocation_size_before) {
+            throw std::runtime_error("reverse move retained an active destination state allocation");
+        }
+        auto suffix = pp_decode_tokens(ctx, {tokens.begin() + 11, tokens.end()}, 11);
+        result.insert(result.end(), suffix.begin(), suffix.end());
+        if (result != expected) {
+            throw std::runtime_error("forward/reverse layer migration changed logits");
+        }
+        printf("PP synchronous migration [%d, %d): state and logits verified\n", first, end);
+    }
+    {
+        const std::vector<ggml_backend_dev_t> original = {devices[0], devices[0], devices[1], devices[1]};
+        llama_context ctx(*model, cparams, original);
+        auto result = pp_decode_tokens(ctx, {tokens.begin(), tokens.begin() + 6});
+        auto * mem = dynamic_cast<llama_memory_hybrid *>(ctx.get_memory());
+        std::vector<std::vector<ggml_tensor *>> state_tensors_before;
+        for (size_t il = 0; il < original.size(); ++il) {
+            state_tensors_before.push_back(mem->layer_state_tensors(il));
+        }
+        std::vector<uint8_t> state_before(llama_state_seq_get_size(&ctx, 0));
+        llama_state_seq_get_data(&ctx, state_before.data(), state_before.size(), 0);
+
+        bool failed = false;
+        try {
+            ctx.migrate_layers_sync(1, 2, devices[1], true);
+        } catch (const std::runtime_error &) {
+            failed = true;
+        }
+        if (!failed) {
+            throw std::runtime_error("injected post-switch migration failure was not reported");
+        }
+        for (size_t il = 0; il < original.size(); ++il) {
+            if (ctx.get_layer_device(il) != original[il] || mem->layer_state_tensors(il) != state_tensors_before[il]) {
+                throw std::runtime_error("failed migration did not restore placement and state bindings");
+            }
+        }
+        std::vector<uint8_t> state_after(llama_state_seq_get_size(&ctx, 0));
+        llama_state_seq_get_data(&ctx, state_after.data(), state_after.size(), 0);
+        if (state_before != state_after) {
+            throw std::runtime_error("failed migration changed sequence state");
+        }
+        pp_append(result, pp_decode_tokens(ctx, {tokens.begin() + 6, tokens.end()}, 6));
+        if (result != expected) {
+            throw std::runtime_error("failed migration changed continued inference");
+        }
+        printf("PP synchronous migration rollback: placement, state, and logits verified\n");
+    }
+    {
+        const std::vector<ggml_backend_dev_t> uniform(4, devices[0]);
+        llama_context ctx(*model, cparams, uniform);
+        auto result = pp_decode_tokens(ctx, {tokens.begin(), tokens.begin() + 6});
+        ctx.migrate_layers_sync(3, 4, devices[1]);
+        auto suffix = pp_decode_tokens(ctx, {tokens.begin() + 6, tokens.end()}, 6);
+        result.insert(result.end(), suffix.begin(), suffix.end());
+        if (result != expected) {
+            throw std::runtime_error("migration from uniform placement changed logits");
+        }
+        printf("PP synchronous migration created a validated stage boundary\n");
+    }
+    {
+        const std::vector<ggml_backend_dev_t> original = {devices[0], devices[0], devices[1], devices[1]};
+        llama_context ctx(*model, cparams, original);
+        llama_memory_seq_add(ctx.get_memory(), 0, 0, -1, 1);
+        bool rejected = false;
+        try {
+            ctx.migrate_layers_sync(1, 2, devices[1]);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw std::runtime_error("experimental placement allowed migration after a state mutation");
+        }
+    }
+    for (const auto & entry : model->tensors_by_name) {
+        if (entry.first.compare(0, 4, "blk.") != 0) {
+            continue;
+        }
+        std::vector<uint8_t> zeros(ggml_nbytes(entry.second), 0);
+        ggml_backend_tensor_set(entry.second, zeros.data(), 0, zeros.size());
+    }
+    if (run_placement() != expected) {
+        throw std::runtime_error("replica graph still reads original layer weights");
+    }
+    {
+        llama_context ctx(*model, cparams);
+        if (pp_decode_tokens(ctx, tokens) == expected) {
+            throw std::runtime_error("layer mutation did not exercise weight binding");
+        }
+    }
+    printf("PP placement: independent weights and state verified\n");
+    return 0;
+}
+
+static int test_qwen35moe_layer_migration(const std::string & model_path, size_t seed, bool low_vram) {
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count() && devices.size() < 2; ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.size() < 2) {
+        fprintf(stderr, "SKIP: Qwen35MoE PP model test requires two GPU devices\n");
+        return 77;
+    }
+
+    std::vector<ggml_backend_dev_t> model_devices;
+    if (low_vram) {
+        auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu) {
+            throw std::runtime_error("Qwen35MoE low-VRAM test requires a CPU backend");
+        }
+        model_devices.push_back(cpu);
+    }
+    model_devices.insert(model_devices.end(), devices.begin(), devices.end());
+    model_devices.push_back(nullptr);
+    std::vector<float> tensor_split(llama_max_devices(), 0.0f);
+    if (low_vram) {
+        tensor_split[0] = 82.0f;
+        tensor_split[1] = 5.0f;
+        tensor_split[2] = 13.0f;
+    } else {
+        tensor_split[0] = 1.0f;
+        tensor_split[1] = 1.0f;
+    }
+    auto params = llama_model_default_params();
+    params.devices = model_devices.data();
+    params.tensor_split = tensor_split.data();
+    params.n_gpu_layers = 999;
+    params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    params.load_mtp = false;
+
+    const int64_t load_start_us = ggml_time_us();
+    llama_model_ptr model(llama_model_load_from_file(model_path.c_str(), params));
+    const int64_t load_us = ggml_time_us() - load_start_us;
+    if (!model) {
+        throw std::runtime_error("could not load Qwen35MoE PP model");
+    }
+    if (model->arch != LLM_ARCH_QWEN35MOE) {
+        throw std::runtime_error("--pp-model requires a Qwen35MoE model");
+    }
+
+    const int32_t n_layer = model->hparams.n_layer();
+    int32_t boundary = -1;
+    for (int32_t il = 1; il < n_layer; ++il) {
+        if (model->dev_layer(il - 1) == devices[0] && model->dev_layer(il) == devices[1]) {
+            if (boundary >= 0) {
+                throw std::runtime_error("Qwen35MoE PP test found multiple selected-device boundaries");
+            }
+            boundary = il;
+        }
+    }
+    if (boundary < 2) {
+        throw std::runtime_error("Qwen35MoE PP test could not find a movable boundary");
+    }
+
+    int32_t recurrent_layer = boundary - 1;
+    while (recurrent_layer >= 0 && !model->hparams.is_recr(recurrent_layer)) {
+        --recurrent_layer;
+    }
+    int32_t full_layer = boundary - 1;
+    while (full_layer >= 0 && model->hparams.is_recr(full_layer)) {
+        --full_layer;
+    }
+    if (recurrent_layer != boundary - 1 || full_layer != boundary - 2) {
+        throw std::runtime_error("Qwen35MoE PP test requires adjacent full and recurrent layers at the PP boundary");
+    }
+
+    std::vector<int64_t> replica_us;
+    for (const int32_t il : {full_layer, recurrent_layer}) {
+        const int64_t start_us = ggml_time_us();
+        model->prepare_layer_replica(il, devices[1]);
+        replica_us.push_back(ggml_time_us() - start_us);
+        const auto & replica = model->layer_on_device(il, devices[1]);
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        size_t n_checked = 0;
+        bool checked_experts = false;
+        for (const auto & entry : model->tensors_by_name) {
+            if (entry.first.compare(0, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            auto * original = entry.second;
+            auto * copied = model->layer_tensor_on_device(il, devices[1], original);
+            if (copied == original || copied->type != original->type ||
+                    !ggml_are_same_shape(original, copied) || !ggml_are_same_stride(original, copied) ||
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(copied->buffer)) != devices[1]) {
+                throw std::runtime_error("Qwen35MoE replica has the wrong storage, layout, or device");
+            }
+            std::vector<uint8_t> expected(ggml_nbytes(original));
+            std::vector<uint8_t> actual(expected.size());
+            ggml_backend_tensor_get(original, expected.data(), 0, expected.size());
+            ggml_backend_tensor_get(copied, actual.data(), 0, actual.size());
+            if (actual != expected) {
+                throw std::runtime_error("Qwen35MoE replica changed weight bytes");
+            }
+            if (original == model->layers[il].ffn_down_exps && replica.ffn_down_exps == copied) {
+                checked_experts = true;
+            }
+            ++n_checked;
+        }
+        if (n_checked == 0 || !checked_experts) {
+            throw std::runtime_error("Qwen35MoE replica did not cover expert weights");
+        }
+        printf("Qwen35MoE replica layer %d (%s): %zu tensors, preparation %.3f ms\n", il,
+                model->hparams.is_recr(il) ? "linear" : "full", n_checked, replica_us.back()/1000.0);
+    }
+
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx = 64;
+    cparams.n_batch = 1;
+    cparams.n_ubatch = 1;
+    cparams.n_seq_max = 1;
+    cparams.n_rs_seq = 0;
+    cparams.n_threads = 4;
+    cparams.n_threads_batch = 4;
+    cparams.offload_kqv = true;
+    cparams.no_perf = false;
+
+    const auto tokens = get_tokens(10, model->vocab.n_tokens(), seed);
+    std::vector<float> expected;
+    std::vector<int64_t> baseline_token_us;
+    {
+        llama_context ctx(*model, cparams);
+        expected = pp_decode_tokens(ctx, tokens, 0, &baseline_token_us);
+    }
+
+    struct migration_case {
+        const char * name;
+        int32_t initial_boundary;
+        int32_t first;
+        int32_t end;
+    };
+    const migration_case cases[] = {
+        {"linear", boundary, recurrent_layer, boundary},
+        {"full", full_layer + 1, full_layer, full_layer + 1},
+        {"mixed", boundary, full_layer, boundary},
+    };
+
+    printf("Qwen35MoE PP model: %d layers, boundary %d, load %.3f ms, devices %s -> %s, CPU prefix %s\n",
+            n_layer, boundary, load_us/1000.0, ggml_backend_dev_name(devices[0]), ggml_backend_dev_name(devices[1]),
+            low_vram ? "enabled" : "disabled");
+    for (const auto & tc : cases) {
+        std::vector<ggml_backend_dev_t> placement;
+        for (int32_t il = 0; il < n_layer; ++il) {
+            placement.push_back(model->dev_layer(il));
+        }
+        if (tc.initial_boundary != boundary) {
+            placement[recurrent_layer] = devices[1];
+        }
+
+        const int64_t context_start_us = ggml_time_us();
+        llama_context ctx(*model, cparams, placement);
+        const int64_t context_us = ggml_time_us() - context_start_us;
+        auto * memory = dynamic_cast<llama_memory_hybrid *>(ctx.get_memory());
+        if (!memory) {
+            throw std::runtime_error("Qwen35MoE PP test requires hybrid memory");
+        }
+
+        std::vector<float> actual;
+        std::vector<int64_t> token_us;
+        pp_append(actual, pp_decode_tokens(ctx, {tokens.begin(), tokens.begin() + 5}, 0, &token_us));
+
+        std::vector<uint8_t> seq_state_before(llama_state_seq_get_size(&ctx, 0));
+        llama_state_seq_get_data(&ctx, seq_state_before.data(), seq_state_before.size(), 0);
+        const auto layer_state_before = pp_layer_state_bytes(*memory, tc.first, tc.end);
+        const auto memory_before = memory->memory_breakdown();
+
+        std::vector<int64_t> forward_us;
+        std::vector<int64_t> reverse_us;
+        for (int round = 0; round < 5; ++round) {
+            int64_t start_us = ggml_time_us();
+            ctx.migrate_layers_sync(tc.first, tc.end, devices[1]);
+            forward_us.push_back(ggml_time_us() - start_us);
+            start_us = ggml_time_us();
+            ctx.migrate_layers_sync(tc.first, tc.end, devices[0]);
+            reverse_us.push_back(ggml_time_us() - start_us);
+        }
+        std::vector<uint8_t> seq_state_roundtrip(llama_state_seq_get_size(&ctx, 0));
+        llama_state_seq_get_data(&ctx, seq_state_roundtrip.data(), seq_state_roundtrip.size(), 0);
+        if (seq_state_roundtrip != seq_state_before ||
+                pp_layer_state_bytes(*memory, tc.first, tc.end) != layer_state_before) {
+            throw std::runtime_error("Qwen35MoE repeated migration changed state bytes");
+        }
+
+        const int64_t forward_start_us = ggml_time_us();
+        ctx.migrate_layers_sync(tc.first, tc.end, devices[1]);
+        const int64_t final_forward_us = ggml_time_us() - forward_start_us;
+        const auto memory_after = memory->memory_breakdown();
+        if (pp_layer_state_bytes(*memory, tc.first, tc.end) != layer_state_before) {
+            throw std::runtime_error("Qwen35MoE forward migration changed layer state bytes");
+        }
+        for (int32_t il = tc.first; il < tc.end; ++il) {
+            if (ctx.get_layer_device(il) != devices[1]) {
+                throw std::runtime_error("Qwen35MoE forward migration did not update layer ownership");
+            }
+            for (auto * tensor : memory->layer_state_tensors(il)) {
+                if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) != devices[1]) {
+                    throw std::runtime_error("Qwen35MoE forward migration put state on the wrong device");
+                }
+            }
+        }
+        if (pp_device_memory(memory_after, devices[0]) >= pp_device_memory(memory_before, devices[0]) ||
+                pp_device_memory(memory_after, devices[1]) <= pp_device_memory(memory_before, devices[1])) {
+            throw std::runtime_error("Qwen35MoE forward migration retained the source state allocation");
+        }
+
+        pp_append(actual, pp_decode_tokens(ctx, {tokens[5]}, 5, &token_us));
+        pp_append(actual, pp_decode_tokens(ctx, {tokens[6]}, 6, &token_us));
+
+        const auto reverse_state_before = pp_layer_state_bytes(*memory, tc.first, tc.end);
+        const int64_t reverse_start_us = ggml_time_us();
+        ctx.migrate_layers_sync(tc.first, tc.end, devices[0]);
+        const int64_t final_reverse_us = ggml_time_us() - reverse_start_us;
+        const auto memory_after_reverse = memory->memory_breakdown();
+        if (pp_layer_state_bytes(*memory, tc.first, tc.end) != reverse_state_before) {
+            throw std::runtime_error("Qwen35MoE reverse migration changed layer state bytes");
+        }
+        for (int32_t il = tc.first; il < tc.end; ++il) {
+            if (ctx.get_layer_device(il) != devices[0]) {
+                throw std::runtime_error("Qwen35MoE reverse migration did not restore layer ownership");
+            }
+            for (auto * tensor : memory->layer_state_tensors(il)) {
+                if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) != devices[0]) {
+                    throw std::runtime_error("Qwen35MoE reverse migration put state on the wrong device");
+                }
+            }
+        }
+        if (pp_device_memory(memory_after_reverse, devices[1]) >= pp_device_memory(memory_after, devices[1]) ||
+                pp_device_memory(memory_after_reverse, devices[0]) <= pp_device_memory(memory_after, devices[0])) {
+            throw std::runtime_error("Qwen35MoE reverse migration retained the source state allocation");
+        }
+        pp_append(actual, pp_decode_tokens(ctx, {tokens.begin() + 7, tokens.end()}, 7, &token_us));
+
+        const auto diff = pp_compare_logits(expected, actual);
+        const auto forward = pp_summarize(forward_us);
+        const auto reverse = pp_summarize(reverse_us);
+        printf("Qwen35MoE migration %s [%d, %d): context %.3f ms, forward min/median/p95 %.3f/%.3f/%.3f ms, reverse %.3f/%.3f/%.3f ms\n",
+                tc.name, tc.first, tc.end, context_us/1000.0,
+                forward.minimum/1000.0, forward.median/1000.0, forward.p95/1000.0,
+                reverse.minimum/1000.0, reverse.median/1000.0, reverse.p95/1000.0);
+        printf("Qwen35MoE migration %s: final forward/reverse %.3f/%.3f ms, token pre/first/stable %.3f/%.3f/%.3f ms, baseline first/stable %.3f/%.3f ms, max abs/rel %.9g/%.9g\n",
+                tc.name, final_forward_us/1000.0, final_reverse_us/1000.0,
+                token_us[4]/1000.0, token_us[5]/1000.0, token_us[6]/1000.0,
+                baseline_token_us[5]/1000.0, baseline_token_us[6]/1000.0, diff.first, diff.second);
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -798,10 +1501,40 @@ int main(int argc, char ** argv) {
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
     std::string out;
+    bool pp_replicas = false;
+    std::string pp_model;
+    bool pp_low_vram = false;
+    std::vector<std::string> pp_rpc_endpoints;
 
     int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--pp-rpc") == 0) {
+            if (i + 2 >= argc || strcmp(argv[i + 1], argv[i + 2]) == 0) {
+                fprintf(stderr, "--pp-rpc requires two distinct endpoints\n");
+                return 1;
+            }
+            pp_replicas = true;
+            pp_rpc_endpoints = {argv[i + 1], argv[i + 2]};
+            i += 2;
+            continue;
+        }
+        if (strcmp(argv[i], "--pp-replicas") == 0) {
+            pp_replicas = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--pp-model") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--pp-model requires a model path\n");
+                return 1;
+            }
+            pp_model = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--pp-low-vram") == 0) {
+            pp_low_vram = true;
+            continue;
+        }
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
@@ -847,6 +1580,12 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (!pp_model.empty()) {
+            return test_qwen35moe_layer_migration(pp_model, seed, pp_low_vram);
+        }
+        if (pp_replicas) {
+            return test_layer_replicas(seed, pp_rpc_endpoints);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }

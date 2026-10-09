@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    const llama_layer_device_cb & layer_device = nullptr,
+                         bool   independent_layers = false);
 
     ~llama_memory_hybrid() = default;
 
@@ -76,6 +78,10 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    llama_memory_layer_move_ptr prepare_layer_move(int32_t il, ggml_backend_dev_t dev);
+    std::vector<ggml_tensor *> layer_state_tensors(int32_t il) const;
+    bool is_append_only() const;
+
     //
     // llama_memory_hybrid specific API
     //
@@ -88,6 +94,9 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    const bool independent_layers;
+    bool append_only = true;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {

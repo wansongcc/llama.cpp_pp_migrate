@@ -33,6 +33,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1168,6 +1169,19 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
+    struct layer_replica {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        llama_layer layer;
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> tensors;
+    };
+
+    std::vector<std::unordered_set<ggml_tensor *>> layer_tensors;
+    std::map<std::pair<int32_t, ggml_backend_dev_t>, std::unique_ptr<layer_replica>> layer_replicas;
+    std::mutex context_mutex;
+    size_t n_contexts = 0;
+    bool exclusive_context = false;
+
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
@@ -1492,6 +1506,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
+    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE) {
+        pimpl->layer_tensors.resize(n_layer_all);
+    }
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
@@ -1838,9 +1855,136 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    auto * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+    if (tensor && tn.bid >= 0 && (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE)) {
+        pimpl->layer_tensors.at(tn.bid).insert(tensor);
+    }
+    return tensor;
+}
+
+std::optional<llama_layer> llama_model::remap_layer(
+        int32_t, const std::unordered_map<const ggml_tensor *, ggml_tensor *> &) const {
+    return std::nullopt;
+}
+
+void llama_model::prepare_layer_replica(int32_t il, ggml_backend_dev_t dev) {
+    std::lock_guard<std::mutex> lock(pimpl->context_mutex);
+    if (pimpl->n_contexts != 0) {
+        throw std::runtime_error("prepare layer replicas before creating a context");
+    }
+    if ((arch != LLM_ARCH_QWEN3NEXT && arch != LLM_ARCH_QWEN35MOE) || hparams.no_alloc || hparams.vocab_only ||
+            split_mode() != LLAMA_SPLIT_MODE_LAYER || has_tensor_overrides()) {
+        throw std::runtime_error("layer replicas require allocated Qwen hybrid weights in layer split mode");
+    }
+    if (il < 0 || uint32_t(il) >= hparams.n_layer() || !dev) {
+        throw std::invalid_argument("invalid layer replica destination");
+    }
+    if (std::none_of(devices.begin(), devices.end(), [dev](const llama_device & d) { return d.dev == dev; })) {
+        throw std::invalid_argument("replica destination is not a model device");
+    }
+    if (dev == dev_layer(il) || pimpl->layer_replicas.count({il, dev})) {
+        return;
+    }
+
+    const auto & originals = pimpl->layer_tensors.at(il);
+    if (originals.empty()) {
+        throw std::runtime_error("layer has no loaded weights");
+    }
+    auto replica = std::make_unique<impl::layer_replica>();
+    ggml_init_params ctx_params = {
+        /* .mem_size   = */ (2*originals.size() + 1)*ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    replica->ctx.reset(ggml_init(ctx_params));
+    if (!replica->ctx) {
+        throw std::runtime_error("failed to create layer replica context");
+    }
+    auto * ctx = replica->ctx.get();
+    std::function<ggml_tensor *(ggml_tensor *)> clone = [&](ggml_tensor * src) -> ggml_tensor * {
+        const auto it = replica->tensors.find(src);
+        if (it != replica->tensors.end()) {
+            return it->second;
+        }
+        ggml_tensor * dst;
+        if (src->view_src) {
+            auto * base = clone(src->view_src);
+            dst = ggml_view_4d(ctx, base, src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                    src->nb[1], src->nb[2], src->nb[3], src->view_offs);
+        } else {
+            dst = ggml_dup_tensor(ctx, src);
+            memcpy(dst->nb, src->nb, sizeof(dst->nb));
+        }
+        ggml_set_name(dst, ggml_get_name(src));
+        replica->tensors.emplace(src, dst);
+        return dst;
+    };
+    for (auto * tensor : originals) {
+        clone(tensor);
+    }
+    auto remapped = remap_layer(il, replica->tensors);
+    if (!remapped) {
+        throw std::runtime_error("layer replicas are not implemented for this architecture");
+    }
+    replica->layer = std::move(*remapped);
+    auto * buft = ggml_backend_dev_buffer_type(dev);
+    replica->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft));
+    if (!replica->buffer) {
+        throw std::runtime_error("failed to allocate layer replica weights");
+    }
+    ggml_backend_buffer_set_usage(replica->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (const auto & entry : replica->tensors) {
+        if (!entry.first->view_src) {
+            ggml_backend_tensor_copy(entry.first, entry.second);
+        }
+    }
+    LLAMA_LOG_INFO("%s: layer %d replica on %s, %.2f MiB\n", __func__, il,
+            ggml_backend_dev_name(dev), ggml_backend_buffer_get_size(replica->buffer.get())/1024.0/1024.0);
+    pimpl->layer_replicas.emplace(std::make_pair(il, dev), std::move(replica));
+}
+
+llama_model_context_guard::llama_model_context_guard(const llama_model & model, bool exclusive) : model(model) {
+    std::lock_guard<std::mutex> lock(model.pimpl->context_mutex);
+    if (model.pimpl->exclusive_context || (exclusive && model.pimpl->n_contexts != 0)) {
+        throw std::runtime_error("experimental placement requires exclusive model context ownership");
+    }
+    ++model.pimpl->n_contexts;
+    model.pimpl->exclusive_context = exclusive;
+}
+
+llama_model_context_guard::~llama_model_context_guard() {
+    std::lock_guard<std::mutex> lock(model.pimpl->context_mutex);
+    --model.pimpl->n_contexts;
+    model.pimpl->exclusive_context = false;
+}
+
+const llama_layer & llama_model::layer_on_device(int32_t il, ggml_backend_dev_t dev) const {
+    if (dev == dev_layer(il)) {
+        return layers.at(il);
+    }
+    return pimpl->layer_replicas.at({il, dev})->layer;
+}
+
+ggml_tensor * llama_model::layer_tensor_on_device(int32_t il, ggml_backend_dev_t dev, ggml_tensor * tensor) const {
+    if (!pimpl->layer_tensors.at(il).count(tensor)) {
+        throw std::invalid_argument("tensor does not belong to this layer");
+    }
+    if (dev == dev_layer(il)) {
+        return tensor;
+    }
+    return pimpl->layer_replicas.at({il, dev})->tensors.at(tensor);
+}
+
+std::vector<ggml_backend_dev_t> llama_model::layer_devices_available(int32_t il) const {
+    std::vector<ggml_backend_dev_t> result = {dev_layer(il)};
+    for (const auto & entry : pimpl->layer_replicas) {
+        if (entry.first.first == il) {
+            result.push_back(entry.first.second);
+        }
+    }
+    return result;
 }
 
 std::string llama_model::arch_name() const {
@@ -1886,6 +2030,10 @@ llama_split_mode llama_model::split_mode() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
+    for (const auto & entry : pimpl->layer_replicas) {
+        auto * buffer = entry.second->buffer.get();
+        ret[ggml_backend_buffer_get_type(buffer)] += ggml_backend_buffer_get_size(buffer);
+    }
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
@@ -2558,7 +2706,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* layer_device      */ params.layer_device,
+                            /* independent_layers */ params.independent_layers);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

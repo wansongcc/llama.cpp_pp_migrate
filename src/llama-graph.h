@@ -768,6 +768,8 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+struct llama_layer;
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -809,9 +811,15 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    const std::vector<const llama_layer *> * active_layers = nullptr;
+    uint64_t placement_epoch = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (placement_epoch != other.placement_epoch || active_layers != other.active_layers) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -889,6 +897,11 @@ struct llm_graph_fused_node {
     int il;
 };
 
+struct llm_graph_layer_node {
+    ggml_tensor * tensor;
+    int il;
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -923,8 +936,10 @@ public:
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);
+    void add_layer_node(llm_graph_layer_node result);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+    const std::vector<llm_graph_layer_node> & get_layer_nodes() const { return layer_nodes; }
 
     void set_params(const llm_graph_params & params);
 
@@ -945,6 +960,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_layer_node> layer_nodes;
 
     ggml_context_ptr ctx_compute;
 
@@ -1037,6 +1053,10 @@ struct llm_graph_context {
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
+
+    const std::vector<const llama_layer *> * active_layers;
+
+    const llama_layer & layer(const llama_model & model, int32_t il) const;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
