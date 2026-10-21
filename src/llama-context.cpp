@@ -21,6 +21,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 //
 // llama_context
@@ -88,7 +89,7 @@ llama_context::llama_context(
         const std::vector<ggml_backend_dev_t> & layer_devices) :
     model(model),
     model_context_guard(std::make_unique<llama_model_context_guard>(model, !layer_devices.empty())),
-    layer_devices(layer_devices),
+    runtime_active(std::make_unique<placement_runtime>()),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -100,6 +101,9 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    runtime_active->layer_devices = layer_devices;
+    runtime_active->generation = next_runtime_generation++;
 
     if (!layer_devices.empty()) {
         if ((model.arch != LLM_ARCH_QWEN3NEXT && model.arch != LLM_ARCH_QWEN35MOE) || model.split_mode() != LLAMA_SPLIT_MODE_LAYER ||
@@ -114,10 +118,10 @@ llama_context::llama_context(
                     [dev](const llama_device & d) { return d.dev == dev; })) {
                 throw std::invalid_argument("placement device is not a model device");
             }
-            active_layers.push_back(&model.layer_on_device(il, dev));
+            runtime_active->layers.push_back(&model.layer_on_device(il, dev));
         }
         validate_layer_devices(layer_devices);
-        placement_epoch = 1;
+        runtime_active->placement_epoch = 1;
     }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
@@ -423,6 +427,11 @@ llama_context::llama_context(
         }
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            runtime_active->memory_view = mem->get_active_view();
+            runtime_active->state_frontier = runtime_active->memory_view->frontier;
+            runtime_active->state_ready = true;
+        }
     }
 
     // init backends
@@ -431,7 +440,7 @@ llama_context::llama_context(
 
         backend_buft.clear();
         backend_ptrs.clear();
-        backend_buf_exp_size.clear();
+        runtime_active->backend_buf_exp_size.clear();
 
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
@@ -448,7 +457,7 @@ llama_context::llama_context(
 
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
-            backend_buf_exp_size.push_back(0);
+            runtime_active->backend_buf_exp_size.push_back(0);
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -512,6 +521,14 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (migration_pending) {
+        for (auto & move : migration_pending->moves) {
+            move->wait();
+        }
+    }
+    if (runtime_candidate && runtime_candidate->sched) {
+        ggml_backend_sched_synchronize(runtime_candidate->sched.get());
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -519,8 +536,8 @@ llama_context::~llama_context() {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
 
-            const size_t size_exp = backend_buf_exp_size[i];
-            const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            const size_t size_exp = active_runtime().backend_buf_exp_size[i];
+            const size_t size_act = ggml_backend_sched_get_buffer_size(active_runtime().sched.get(), backend);
             if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -533,8 +550,19 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+llama_context::placement_runtime & llama_context::active_runtime() {
+    GGML_ASSERT(runtime_active);
+    return *runtime_active;
+}
+
+const llama_context::placement_runtime & llama_context::active_runtime() const {
+    GGML_ASSERT(runtime_active);
+    return *runtime_active;
+}
+
 ggml_backend_dev_t llama_context::get_layer_device(int32_t il) const {
-    return layer_devices.empty() ? model.dev_layer(il) : layer_devices.at(il);
+    const auto & runtime = active_runtime();
+    return runtime.layer_devices.empty() ? model.dev_layer(il) : runtime.layer_devices.at(il);
 }
 
 void llama_context::validate_layer_devices(const std::vector<ggml_backend_dev_t> & devices) const {
@@ -549,14 +577,14 @@ void llama_context::validate_layer_devices(const std::vector<ggml_backend_dev_t>
     }
 }
 
-void llama_context::validate_layer_backends(const llm_graph_result & result) const {
-    if (layer_devices.empty()) {
+void llama_context::validate_layer_backends(const llm_graph_result & result, const placement_runtime & runtime) const {
+    if (runtime.layer_devices.empty()) {
         return;
     }
     auto * graph = result.get_gf();
     auto ** nodes = ggml_graph_nodes(graph);
     const int n_nodes = ggml_graph_n_nodes(graph);
-    std::vector<std::pair<int, int>> ranges(layer_devices.size(), {n_nodes, -1});
+    std::vector<std::pair<int, int>> ranges(runtime.layer_devices.size(), {n_nodes, -1});
     for (const auto & node : result.get_layer_nodes()) {
         const auto it = std::find(nodes, nodes + n_nodes, node.tensor);
         if (it == nodes + n_nodes) {
@@ -570,6 +598,12 @@ void llama_context::validate_layer_backends(const llm_graph_result & result) con
     int previous_end = -1;
     for (size_t il = 0; il < ranges.size(); ++il) {
         const auto range = ranges[il];
+        if (runtime.replay_end >= 0 && (int32_t(il) < runtime.replay_first || int32_t(il) >= runtime.replay_end)) {
+            if (range.first <= range.second) {
+                throw std::runtime_error("replay graph contains an out-of-range layer");
+            }
+            continue;
+        }
         if (range.first > range.second || range.first <= previous_end) {
             throw std::runtime_error(format("experimental layer %zu has no isolated graph range", il));
         }
@@ -579,9 +613,9 @@ void llama_context::validate_layer_backends(const llm_graph_result & result) con
                     tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE) {
                 continue;
             }
-            auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+            auto * backend = ggml_backend_sched_get_tensor_backend(runtime.sched.get(), tensor);
             auto * actual = backend ? ggml_backend_get_device(backend) : nullptr;
-            auto * expected = get_layer_device(il);
+            auto * expected = runtime.layer_devices.at(il);
             if (actual != expected) {
                 throw std::runtime_error(format("experimental layer %zu node '%s' fell back from %s to %s", il,
                         ggml_get_name(tensor), ggml_backend_dev_name(expected), actual ? ggml_backend_dev_name(actual) : "none"));
@@ -593,7 +627,8 @@ void llama_context::validate_layer_backends(const llm_graph_result & result) con
 
 void llama_context::validate_candidate_backends() {
     auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    if (layer_devices.empty() || !mem) {
+    const auto & active = active_runtime();
+    if (active.layer_devices.empty() || !mem) {
         return;
     }
 
@@ -602,19 +637,19 @@ void llama_context::validate_candidate_backends() {
         return std::find(devices.begin(), devices.end(), dev) != devices.end();
     };
 
-    validated_layer_placements = {layer_devices};
+    validated_layer_placements = {active.layer_devices};
     std::vector<std::vector<ggml_backend_dev_t>> candidates;
-    for (size_t run_first = 0; run_first < layer_devices.size();) {
+    for (size_t run_first = 0; run_first < active.layer_devices.size();) {
         size_t run_end = run_first + 1;
-        while (run_end < layer_devices.size() && layer_devices[run_end] == layer_devices[run_first]) {
+        while (run_end < active.layer_devices.size() && active.layer_devices[run_end] == active.layer_devices[run_first]) {
             ++run_end;
         }
 
         const auto dev_it = std::find_if(model.devices.begin(), model.devices.end(),
-                [&](const llama_device & d) { return d.dev == layer_devices[run_first]; });
+                [&](const llama_device & d) { return d.dev == active.layer_devices[run_first]; });
         const size_t dev_index = dev_it - model.devices.begin();
         if (dev_index + 1 < model.devices.size()) {
-            auto forward = layer_devices;
+            auto forward = active.layer_devices;
             auto * destination = model.devices[dev_index + 1].dev;
             for (size_t first = run_end; first > run_first && available(first - 1, destination);) {
                 forward[--first] = destination;
@@ -622,7 +657,7 @@ void llama_context::validate_candidate_backends() {
             }
         }
         if (dev_index > 0) {
-            auto reverse = layer_devices;
+            auto reverse = active.layer_devices;
             auto * destination = model.devices[dev_index - 1].dev;
             for (size_t end = run_first; end < run_end && available(end, destination); ++end) {
                 reverse[end] = destination;
@@ -633,71 +668,55 @@ void llama_context::validate_candidate_backends() {
     }
 
     for (const auto & candidate : candidates) {
-        std::vector<const llama_layer *> candidate_layers = active_layers;
+        placement_runtime runtime;
+        runtime.layer_devices = candidate;
+        runtime.layers = active.layers;
+        runtime.placement_epoch = active.placement_epoch + 1;
+        runtime.generation = next_runtime_generation++;
+        runtime.backend_buf_exp_size.assign(backend_ptrs.size(), 0);
+        runtime.memory_view = mem->clone_active_view(candidate);
+        runtime.state_frontier = runtime.memory_view->frontier;
+        runtime.state_ready = true;
+
         std::vector<llama_memory_layer_move_ptr> moves;
         for (size_t il = 0; il < candidate.size(); ++il) {
-            if (candidate[il] == layer_devices[il]) {
+            if (candidate[il] == active.layer_devices[il]) {
                 continue;
             }
-            candidate_layers[il] = &model.layer_on_device(il, candidate[il]);
+            runtime.layers[il] = &model.layer_on_device(il, candidate[il]);
             moves.push_back(mem->prepare_layer_move(il, candidate[il]));
         }
 
         const auto saved_cparams = cparams;
-        const auto saved_epoch = placement_epoch;
-
-        ggml_backend_sched_reset(sched.get());
-        gf_res_prev->reset();
-        gf_res_reserve->reset();
-        for (auto & move : moves) {
-            move->swap();
-        }
-        auto original_devices = layer_devices;
-        auto original_layers = active_layers;
-        layer_devices = candidate;
-        active_layers = std::move(candidate_layers);
-        ++placement_epoch;
         try {
-            sched_need_reserve = true;
-            sched_reserve();
+            sched_reserve(runtime);
         } catch (...) {
             const auto failure = std::current_exception();
-            ggml_backend_sched_reset(sched.get());
-            gf_res_prev->reset();
-            gf_res_reserve->reset();
-            for (auto & move : moves) {
-                move->swap();
-            }
-            layer_devices = std::move(original_devices);
-            active_layers = std::move(original_layers);
-            placement_epoch = saved_epoch;
             cparams = saved_cparams;
-            moves.clear();
-            sched_need_reserve = true;
-            sched_reserve();
             std::rethrow_exception(failure);
         }
-
-        ggml_backend_sched_reset(sched.get());
-        gf_res_prev->reset();
-        gf_res_reserve->reset();
-        for (auto & move : moves) {
-            move->swap();
-        }
-        layer_devices = std::move(original_devices);
-        active_layers = std::move(original_layers);
-        placement_epoch = saved_epoch;
         cparams = saved_cparams;
-        moves.clear();
-        sched_need_reserve = true;
-        sched_reserve();
         validated_layer_placements.push_back(candidate);
     }
 }
 
 void llama_context::migrate_layers_sync(
         int32_t first, int32_t end, ggml_backend_dev_t destination, bool fail_after_switch) {
-    if (layer_devices.empty() || first < 0 || first >= end || size_t(end) > layer_devices.size()) {
+    const auto request_id = migrate_layers_async_begin(first, end, destination);
+    if (!migrate_layers_async_commit(request_id, fail_after_switch)) {
+        throw std::runtime_error("synchronous migration became stale");
+    }
+}
+
+uint64_t llama_context::migrate_layers_async_begin(
+        int32_t first, int32_t end, ggml_backend_dev_t destination) {
+    if (migration_pending) {
+        throw std::runtime_error("another layer migration is pending");
+    }
+    last_layer_migration_stats = {};
+    const int64_t total_start_us = ggml_time_us();
+    auto & active = active_runtime();
+    if (active.layer_devices.empty() || first < 0 || first >= end || size_t(end) > active.layer_devices.size()) {
         throw std::invalid_argument("invalid experimental layer migration interval");
     }
     if (opt_ctx || !sampling.samplers.empty() || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
@@ -711,11 +730,11 @@ void llama_context::migrate_layers_sync(
     if (!mem->is_append_only()) {
         throw std::invalid_argument("layer migration requires append-only state");
     }
-    const auto source = layer_devices[first];
-    auto next_devices = layer_devices;
-    auto next_layers = active_layers;
+    const auto source = active.layer_devices[first];
+    auto next_devices = active.layer_devices;
+    auto next_layers = active.layers;
     for (int32_t il = first; il < end; ++il) {
-        if (layer_devices[il] != source || source == destination) {
+        if (active.layer_devices[il] != source || source == destination) {
             throw std::invalid_argument("migration must move a single PP stage interval to another device");
         }
         next_devices[il] = destination;
@@ -734,51 +753,519 @@ void llama_context::migrate_layers_sync(
         throw std::invalid_argument("migration layout was not validated before generation");
     }
 
-    const auto previous_cparams = cparams;
+    const int64_t synchronize_start_us = ggml_time_us();
     synchronize();
-    std::vector<llama_memory_layer_move_ptr> moves;
+    last_layer_migration_stats.synchronize_us = ggml_time_us() - synchronize_start_us;
+
+    auto candidate_view = mem->clone_active_view(next_devices);
+    const uint64_t candidate_frontier = candidate_view->frontier;
+
+    const int64_t prepare_start_us = ggml_time_us();
+    auto pending = std::make_unique<pending_migration>();
+    pending->request_id = next_migration_request_id++;
+    pending->source_generation = active.generation;
+    pending->source_view_generation = active.memory_view->generation;
+    pending->frontier = candidate_frontier;
+    pending->first = first;
+    pending->end = end;
+    pending->source = source;
+    pending->destination = destination;
+    pending->candidate_view = candidate_view;
+    pending->total_start_us = total_start_us;
     for (int32_t il = first; il < end; ++il) {
-        moves.push_back(mem->prepare_layer_move(il, destination));
+        pending->moves.push_back(mem->prepare_layer_move(il, destination));
+        last_layer_migration_stats.kv_bytes += pending->moves.back()->kv_bytes();
+        last_layer_migration_stats.kv_valid_bytes += pending->moves.back()->kv_valid_bytes();
+        last_layer_migration_stats.recurrent_bytes += pending->moves.back()->recurrent_bytes();
+    }
+    const auto find_backend = [&](ggml_backend_dev_t dev) -> ggml_backend_t {
+        const auto it = std::find_if(backends.begin(), backends.end(), [dev](const ggml_backend_ptr & backend) {
+            return ggml_backend_get_device(backend.get()) == dev;
+        });
+        return it == backends.end() ? nullptr : it->get();
+    };
+    auto * backend_src = find_backend(source);
+    auto * backend_dst = find_backend(destination);
+    if (!backend_src || !backend_dst) {
+        throw std::runtime_error("migration backend is not initialized");
+    }
+    for (auto & move : pending->moves) {
+        move->copy_async(backend_src, backend_dst);
+        last_layer_migration_stats.copy_us += move->copy_us();
+    }
+    last_layer_migration_stats.prepare_us = ggml_time_us() - prepare_start_us;
+
+    if (!runtime_candidate || runtime_candidate->layer_devices != next_devices) {
+        runtime_candidate = std::make_unique<placement_runtime>();
+        runtime_candidate->layer_devices = next_devices;
+        runtime_candidate->layers = next_layers;
+        runtime_candidate->backend_buf_exp_size.assign(backend_ptrs.size(), 0);
+    }
+    runtime_candidate->memory_view = candidate_view;
+    runtime_candidate->placement_epoch = active.placement_epoch + 1;
+    runtime_candidate->generation = next_runtime_generation++;
+    runtime_candidate->state_frontier = candidate_frontier;
+    runtime_candidate->state_ready = true;
+
+    const int64_t reserve_start_us = ggml_time_us();
+    try {
+        sched_reserve(*runtime_candidate);
+    } catch (...) {
+        for (auto & move : pending->moves) {
+            move->wait();
+        }
+        runtime_candidate->state_ready = false;
+        runtime_candidate->reserve_ready = false;
+        runtime_candidate->sched_need_reserve = true;
+        throw;
+    }
+    last_layer_migration_stats.reserve_us = ggml_time_us() - reserve_start_us;
+
+    const auto request_id = pending->request_id;
+    migration_pending = std::move(pending);
+    return request_id;
+}
+
+bool llama_context::migrate_layers_async_commit(uint64_t request_id, bool fail_after_switch) {
+    if (!migration_pending || migration_pending->request_id != request_id) {
+        throw std::invalid_argument("unknown layer migration request");
+    }
+    auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    GGML_ASSERT(mem);
+    auto & pending = *migration_pending;
+
+    for (auto & move : pending.moves) {
+        move->wait();
     }
 
-    // Keep the old allocations alive until all graphs have dropped their references.
-    ggml_backend_sched_reset(sched.get());
-    gf_res_prev->reset();
-    gf_res_reserve->reset();
-    for (auto & move : moves) {
+    const auto & active = active_runtime();
+    if (active.generation != pending.source_generation || active.memory_view->generation != pending.source_view_generation ||
+            active.memory_view->frontier != pending.frontier || !mem->is_append_only() || !pending.journal_valid) {
+        runtime_candidate->state_ready = false;
+        migration_pending.reset();
+        return false;
+    }
+    if (!runtime_candidate->state_ready || !runtime_candidate->reserve_ready ||
+            runtime_candidate->state_frontier != active.memory_view->frontier ||
+            runtime_candidate->memory_view->frontier != active.memory_view->frontier) {
+        throw std::runtime_error("candidate runtime is not ready at the active frontier");
+    }
+
+    const int64_t switch_start_us = ggml_time_us();
+    for (auto & move : pending.moves) {
         move->swap();
     }
-    layer_devices.swap(next_devices);
-    active_layers.swap(next_layers);
-    const auto previous_epoch = placement_epoch++;
+    mem->exchange_active_view(pending.candidate_view, pending.frontier);
+    runtime_candidate->memory_view = mem->get_active_view();
+    runtime_active->memory_view = pending.candidate_view;
+    runtime_rollback = std::move(runtime_active);
+    runtime_active = std::move(runtime_candidate);
+    last_layer_migration_stats.switch_us = ggml_time_us() - switch_start_us;
     try {
         if (fail_after_switch) {
             throw std::runtime_error("injected migration failure after placement switch");
         }
-        sched_need_reserve = true;
-        sched_reserve();
     } catch (...) {
         const auto failure = std::current_exception();
-        ggml_backend_sched_reset(sched.get());
-        gf_res_prev->reset();
-        gf_res_reserve->reset();
-        for (auto & move : moves) {
+        runtime_candidate = std::move(runtime_active);
+        runtime_active = std::move(runtime_rollback);
+        for (auto & move : pending.moves) {
             move->swap();
         }
-        layer_devices.swap(next_devices);
-        active_layers.swap(next_layers);
-        placement_epoch = previous_epoch;
-        cparams = previous_cparams;
-        moves.clear();
-        sched_need_reserve = true;
-        sched_reserve();
+        mem->exchange_active_view(pending.candidate_view, pending.frontier);
+        runtime_active->memory_view = mem->get_active_view();
+        runtime_candidate->memory_view = pending.candidate_view;
+        migration_pending.reset();
         std::rethrow_exception(failure);
     }
+    runtime_candidate = std::move(runtime_rollback);
+    last_layer_migration_stats.total_us = ggml_time_us() - pending.total_start_us;
     LLAMA_LOG_INFO("%s: layers [%d, %d) moved from %s to %s, epoch %" PRIu64 "\n", __func__,
-            first, end, ggml_backend_dev_name(source), ggml_backend_dev_name(destination), placement_epoch);
+            pending.first, pending.end, ggml_backend_dev_name(pending.source), ggml_backend_dev_name(pending.destination), active_runtime().placement_epoch);
+    migration_pending.reset();
+    return true;
 }
 
-void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
+void llama_context::migrate_layers_async_cancel(uint64_t request_id) {
+    if (!migration_pending || migration_pending->request_id != request_id) {
+        throw std::invalid_argument("unknown layer migration request");
+    }
+    for (auto & move : migration_pending->moves) {
+        move->wait();
+    }
+    if (runtime_candidate) {
+        runtime_candidate->state_ready = false;
+    }
+    migration_pending.reset();
+}
+
+bool llama_context::enable_layer_migration_shadow(uint64_t request_id) {
+    if (!migration_pending || migration_pending->request_id != request_id || !runtime_candidate || migration_pending->replay_enabled) {
+        return false;
+    }
+    for (auto & move : migration_pending->moves) {
+        move->wait();
+    }
+    if (active_runtime().generation != migration_pending->source_generation ||
+            active_runtime().memory_view->frontier != migration_pending->frontier ||
+            runtime_candidate->memory_view->frontier != migration_pending->frontier ||
+            !runtime_candidate->state_ready || !runtime_candidate->reserve_ready) {
+        return false;
+    }
+    migration_pending->shadow_enabled = true;
+    return true;
+}
+
+bool llama_context::enable_layer_migration_replay(uint64_t request_id, size_t capacity_tokens) {
+    if (!migration_pending || migration_pending->request_id != request_id || !runtime_candidate ||
+            migration_pending->shadow_enabled || migration_pending->replay_enabled || capacity_tokens == 0 ||
+            cparams.n_seq_max != 1 || model.hparams.n_embd_inp() != model.hparams.n_embd ||
+            model.hparams.f_embedding_scale != 0.0f || !loras->empty()) {
+        return false;
+    }
+    auto & pending = *migration_pending;
+    for (auto & move : pending.moves) {
+        move->wait();
+    }
+    if (active_runtime().memory_view->frontier != pending.frontier ||
+            active_runtime().generation != pending.source_generation ||
+            active_runtime().memory_view->generation != pending.source_view_generation ||
+            !dynamic_cast<llama_memory_hybrid *>(memory.get())->is_append_only() ||
+            !runtime_candidate->state_ready) {
+        return false;
+    }
+    pending.journal_capacity = capacity_tokens;
+    pending.replay_enabled = true;
+    return true;
+}
+
+void llama_context::record_migration_hidden(const llama_ubatch & ubatch, const llm_graph_result & result) {
+    if (!migration_pending || !migration_pending->replay_enabled || !migration_pending->journal_valid) {
+        return;
+    }
+    auto & pending = *migration_pending;
+    const auto invalidate = [&]() {
+        pending.journal_valid = false;
+        runtime_candidate->state_ready = false;
+        LLAMA_LOG_WARN("%s: candidate journal invalidated\n", __func__);
+    };
+    if (active_runtime().memory_view->generation != pending.source_view_generation ||
+            !dynamic_cast<llama_memory_hybrid *>(memory.get())->is_append_only() ||
+            ubatch.n_tokens != 1 ||
+            ubatch.n_tokens > pending.journal_capacity - pending.journal.size()) {
+        invalidate();
+        return;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != 0 ||
+                uint64_t(ubatch.pos[i]) != pending.frontier + pending.journal.size() + i) {
+            invalidate();
+            return;
+        }
+    }
+    const int64_t start = ggml_time_us();
+    auto * tensor = result.get_layer_inp(pending.first);
+    if (!tensor || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+        invalidate();
+        return;
+    }
+    ggml_backend_sched_synchronize(active_runtime().sched.get());
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        pending_migration::hidden_entry entry;
+        entry.hidden.resize(model.hparams.n_embd);
+        entry.positions.resize(model.hparams.n_pos_per_embd());
+        entry.has_token = ubatch.token != nullptr;
+        entry.token = entry.has_token ? ubatch.token[i] : LLAMA_TOKEN_NULL;
+        for (size_t p = 0; p < entry.positions.size(); ++p) {
+            entry.positions[p] = ubatch.pos[p * ubatch.n_tokens + i];
+        }
+        const size_t bytes = entry.hidden.size() * sizeof(float);
+        ggml_backend_tensor_get(tensor, entry.hidden.data(), i * bytes, bytes);
+        pending.journal.push_back(std::move(entry));
+        last_layer_migration_stats.journal_bytes += bytes;
+        last_layer_migration_stats.journal_peak_bytes = std::max(last_layer_migration_stats.journal_peak_bytes,
+                pending.journal.size() * (bytes + model.hparams.n_pos_per_embd() * sizeof(llama_pos) + sizeof(llama_token)));
+    }
+    last_layer_migration_stats.journal_us += ggml_time_us() - start;
+}
+
+bool llama_context::replay_layer_migration(uint64_t request_id, int32_t fail_after_tokens) {
+    if (!migration_pending || migration_pending->request_id != request_id || !runtime_candidate) {
+        return false;
+    }
+    auto & pending = *migration_pending;
+    auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!pending.replay_enabled || !pending.journal_valid || !runtime_candidate->state_ready ||
+            !mem->is_append_only() || active_runtime().generation != pending.source_generation ||
+            active_runtime().memory_view->generation != pending.source_view_generation ||
+            active_runtime().memory_view->frontier != pending.frontier + pending.journal.size()) {
+        pending.journal_valid = false;
+        runtime_candidate->state_ready = false;
+        return false;
+    }
+    synchronize();
+    const int64_t start = ggml_time_us();
+    const auto saved_n_outputs = n_outputs;
+    const auto saved_n_reused = n_reused;
+    try {
+        if (!pending.replay_runtime && !pending.journal.empty()) {
+            auto runtime = std::make_unique<placement_runtime>();
+            runtime->layer_devices = runtime_candidate->layer_devices;
+            runtime->layers = runtime_candidate->layers;
+            runtime->memory_view = pending.candidate_view;
+            runtime->placement_epoch = runtime_candidate->placement_epoch;
+            runtime->backend_buf_exp_size.assign(backend_ptrs.size(), 0);
+            const size_t max_nodes = graph_max_nodes(1);
+            runtime->gf_res_prev.reset(new llm_graph_result(max_nodes));
+            runtime->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
+                    backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+            runtime->replay_first = pending.first;
+            runtime->replay_end = pending.end;
+            pending.replay_runtime = std::move(runtime);
+        }
+        int32_t completed = 0;
+        for (auto & entry : pending.journal) {
+            const int64_t step_start = ggml_time_us();
+            int32_t n_seq_id = 1;
+            llama_seq_id seq_id = 0;
+            llama_seq_id * seq_ids = &seq_id;
+            int8_t output = 1;
+            llama_batch batch = {1, entry.has_token ? &entry.token : nullptr, entry.hidden.data(), entry.positions.data(), &n_seq_id, &seq_ids, &output};
+            llama_batch_allocr replay_balloc(model.hparams.n_pos_per_embd());
+            if (!replay_balloc.init(batch, model.vocab, nullptr, model.hparams.n_embd, 1, false)) {
+                throw std::runtime_error("invalid replay batch");
+            }
+            auto mctx = mem->init_batch(pending.candidate_view, replay_balloc, 1, false);
+            if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS || fail_after_tokens == 0) {
+                throw std::runtime_error("replay preparation failed");
+            }
+            n_outputs = 1;
+            ggml_status status;
+            if (!process_ubatch(*pending.replay_runtime, mctx->get_ubatch(), LLM_GRAPH_TYPE_DEFAULT, mctx.get(), status)) {
+                throw std::runtime_error("replay computation failed");
+            }
+            ggml_backend_sched_synchronize(pending.replay_runtime->sched.get());
+            size_t compute_bytes = 0;
+            for (auto * backend : backend_ptrs) {
+                compute_bytes += ggml_backend_sched_get_buffer_size(pending.replay_runtime->sched.get(), backend);
+            }
+            last_layer_migration_stats.replay_compute_bytes = std::max(last_layer_migration_stats.replay_compute_bytes, compute_bytes);
+            ++last_layer_migration_stats.replay_tokens;
+            last_layer_migration_stats.replay_layer_tokens += pending.end - pending.first;
+            if (last_layer_migration_stats.replay_step_us.size() < 1024) {
+                last_layer_migration_stats.replay_step_us.push_back(ggml_time_us() - step_start);
+            }
+            if (++completed == fail_after_tokens) {
+                throw std::runtime_error("injected failure after replay computation");
+            }
+        }
+        pending.frontier = pending.candidate_view->frontier;
+        runtime_candidate->state_frontier = pending.frontier;
+        pending.journal.clear();
+    } catch (...) {
+        if (pending.replay_runtime) {
+            ggml_backend_sched_synchronize(pending.replay_runtime->sched.get());
+        }
+        pending.journal_valid = false;
+        runtime_candidate->state_ready = false;
+        n_outputs = saved_n_outputs;
+        n_reused = saved_n_reused;
+        throw;
+    }
+    n_outputs = saved_n_outputs;
+    n_reused = saved_n_reused;
+    last_layer_migration_stats.replay_us += ggml_time_us() - start;
+    LLAMA_LOG_INFO("%s: layers [%d, %d), frontier %" PRIu64 ", tokens %zu, hidden bytes %zu, replay %.3f ms\n",
+            __func__, pending.first, pending.end, pending.frontier, last_layer_migration_stats.replay_tokens,
+            last_layer_migration_stats.journal_bytes, last_layer_migration_stats.replay_us / 1000.0);
+    return true;
+}
+
+bool llama_context::process_shadow_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype) {
+    if (!migration_pending || !migration_pending->shadow_enabled || !runtime_candidate) {
+        return true;
+    }
+    auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem || !mem->is_append_only() || !runtime_candidate->state_ready || !runtime_candidate->reserve_ready ||
+            active_runtime().generation != migration_pending->source_generation ||
+            active_runtime().memory_view->frontier != migration_pending->frontier ||
+            runtime_candidate->memory_view->frontier != migration_pending->frontier) {
+        runtime_candidate->state_ready = false;
+        migration_pending->shadow_enabled = false;
+        return false;
+    }
+    const int64_t shadow_start = ggml_time_us();
+
+    struct tensor_snapshot {
+        ggml_tensor * tensor;
+        std::vector<uint8_t> data;
+    };
+    std::vector<tensor_snapshot> shared;
+    std::unordered_set<ggml_tensor *> seen;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        if (il >= (uint32_t) migration_pending->first && il < (uint32_t) migration_pending->end) {
+            continue;
+        }
+        for (auto * tensor : mem->layer_state_tensors(runtime_candidate->memory_view, il)) {
+            if (!tensor || !seen.insert(tensor).second) {
+                continue;
+            }
+            shared.push_back({tensor, std::vector<uint8_t>(ggml_nbytes(tensor))});
+            ggml_backend_tensor_get(tensor, shared.back().data.data(), 0, shared.back().data.size());
+            last_layer_migration_stats.shadow_shared_bytes += 2 * shared.back().data.size();
+        }
+    }
+
+    auto restore_shared = [&]() {
+        ggml_backend_sched_synchronize(runtime_candidate->sched.get());
+        for (const auto & snapshot : shared) {
+            ggml_backend_tensor_set(snapshot.tensor, snapshot.data.data(), 0, snapshot.data.size());
+        }
+    };
+
+    auto mctx = mem->init_ubatches(runtime_candidate->memory_view, {ubatch});
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        runtime_candidate->state_ready = false;
+        migration_pending->shadow_enabled = false;
+        return false;
+    }
+    const int32_t saved_n_reused = n_reused;
+    ggml_status status = GGML_STATUS_SUCCESS;
+    llm_graph_result * result = nullptr;
+    try {
+        result = process_ubatch(*runtime_candidate, ubatch, gtype, mctx.get(), status);
+    } catch (...) {
+        restore_shared();
+        n_reused = saved_n_reused;
+        runtime_candidate->state_ready = false;
+        migration_pending->shadow_enabled = false;
+        throw;
+    }
+    restore_shared();
+    n_reused = saved_n_reused;
+    if (!result) {
+        runtime_candidate->state_ready = false;
+        migration_pending->shadow_enabled = false;
+        return false;
+    }
+    runtime_candidate->state_frontier = runtime_candidate->memory_view->frontier;
+    migration_pending->frontier = runtime_candidate->state_frontier;
+    runtime_candidate->graph_ready = true;
+    last_layer_migration_stats.shadow_us += ggml_time_us() - shadow_start;
+    return true;
+}
+
+bool llama_context::warmup_layer_migration_candidate(uint64_t request_id, uint32_t n_steps) {
+    if (!migration_pending || migration_pending->request_id != request_id || !runtime_candidate ||
+            migration_pending->shadow_enabled || !runtime_candidate->state_ready ||
+            !runtime_candidate->reserve_ready || n_steps < 2) {
+        return false;
+    }
+    auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem) {
+        return false;
+    }
+    for (auto & move : migration_pending->moves) {
+        move->wait();
+    }
+    if (active_runtime().generation != migration_pending->source_generation ||
+            active_runtime().memory_view->frontier != migration_pending->frontier ||
+            runtime_candidate->memory_view->frontier != migration_pending->frontier || !mem->is_append_only()) {
+        return false;
+    }
+
+    struct tensor_snapshot {
+        ggml_tensor * tensor;
+        std::vector<uint8_t> data;
+    };
+    std::vector<tensor_snapshot> tensors;
+    std::unordered_set<ggml_tensor *> seen;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        for (auto * tensor : mem->layer_state_tensors(runtime_candidate->memory_view, il)) {
+            if (!tensor || !seen.insert(tensor).second) {
+                continue;
+            }
+            tensors.push_back({tensor, std::vector<uint8_t>(ggml_nbytes(tensor))});
+            ggml_backend_tensor_get(tensor, tensors.back().data.data(), 0, tensors.back().data.size());
+        }
+    }
+
+    auto metadata_attn = std::make_shared<llama_kv_cache::metadata>(*runtime_candidate->memory_view->attn);
+    metadata_attn->v_cells = std::make_shared<llama_kv_cells_vec>(*runtime_candidate->memory_view->attn->v_cells);
+    const auto metadata_recurrent = std::make_shared<llama_memory_recurrent::metadata>(*runtime_candidate->memory_view->recurrent);
+    const uint64_t frontier = runtime_candidate->memory_view->frontier;
+    const bool append_only = runtime_candidate->memory_view->append_only;
+    const uint32_t saved_n_outputs = n_outputs;
+    const int32_t saved_n_reused = n_reused;
+
+    const auto restore = [&]() {
+        ggml_backend_sched_synchronize(runtime_candidate->sched.get());
+        for (const auto & snapshot : tensors) {
+            ggml_backend_tensor_set(snapshot.tensor, snapshot.data.data(), 0, snapshot.data.size());
+        }
+        *runtime_candidate->memory_view->attn = *metadata_attn;
+        *runtime_candidate->memory_view->recurrent = *metadata_recurrent;
+        runtime_candidate->memory_view->frontier = frontier;
+        runtime_candidate->memory_view->append_only = append_only;
+        runtime_candidate->state_frontier = frontier;
+        n_outputs = saved_n_outputs;
+        n_reused = saved_n_reused;
+    };
+
+    try {
+        llama_token token = 0;
+        llama_pos pos = frontier;
+        int32_t n_seq_id = 1;
+        llama_seq_id seq_id = 0;
+        llama_seq_id * seq_ids = &seq_id;
+        int8_t logits_flag = 1;
+        llama_batch batch = {
+            /*.n_tokens =*/ 1,
+            /*.token    =*/ &token,
+            /*.embd     =*/ nullptr,
+            /*.pos      =*/ &pos,
+            /*.n_seq_id =*/ &n_seq_id,
+            /*.seq_id   =*/ &seq_ids,
+            /*.logits   =*/ &logits_flag,
+        };
+
+        for (uint32_t step = 0; step < n_steps; ++step) {
+            pos = frontier + step;
+            llama_batch_allocr warmup_balloc(model.hparams.n_pos_per_embd());
+            if (!warmup_balloc.init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), 1, false)) {
+                throw std::runtime_error("failed to initialize candidate warmup batch");
+            }
+            auto mctx = mem->init_batch(runtime_candidate->memory_view, warmup_balloc, 1, false);
+            if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to initialize candidate warmup memory");
+            }
+            n_outputs = 1;
+            ggml_status status = GGML_STATUS_SUCCESS;
+            const auto & ubatch = mctx->get_ubatch();
+            if (!process_ubatch(*runtime_candidate, ubatch, LLM_GRAPH_TYPE_DEFAULT, mctx.get(), status)) {
+                throw std::runtime_error("candidate warmup graph failed");
+            }
+            ggml_backend_sched_synchronize(runtime_candidate->sched.get());
+        }
+        runtime_candidate->graph_ready = true;
+    } catch (...) {
+        restore();
+        runtime_candidate->graph_ready = false;
+        throw;
+    }
+    restore();
+    return true;
+}
+
+const llama_layer_migration_stats & llama_context::get_last_layer_migration_stats() const {
+    return last_layer_migration_stats;
+}
+
+const llama_sched_reserve_stats & llama_context::get_last_sched_reserve_stats() const {
+    return last_sched_reserve_stats;
+}
+
+void llama_context::resolve_fused_ops(placement_runtime & runtime, const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
         if (!enabled) {
@@ -787,25 +1274,25 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
         const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
 
-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+        auto * gf = graph_reserve(runtime, n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
         if (!gf) {
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
         bool device_mismatch = false;
-        for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+        for (const auto & node : runtime.gf_res_reserve->get_fused_nodes()) {
             if (node.op != probe.op) {
                 continue;
             }
 
             GGML_ASSERT(node.il >= 0);
 
-            ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
+            ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(runtime.sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
             // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = get_layer_device(node.il);
+            ggml_backend_dev_t device_layer = runtime.layer_devices.empty() ? model.dev_layer(node.il) : runtime.layer_devices.at(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -856,17 +1343,39 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 }
 
 void llama_context::sched_reserve() {
-    if (!sched_need_reserve) {
+    sched_reserve(active_runtime());
+}
+
+void llama_context::sched_reserve(placement_runtime & runtime) {
+    if (!runtime.sched_need_reserve) {
         return;
     }
+    if (&runtime == runtime_active.get() && migration_pending && migration_pending->replay_enabled) {
+        migration_pending->journal_valid = false;
+        runtime_candidate->state_ready = false;
+    }
 
-    sched_need_reserve = false;
+    runtime.sched_need_reserve = false;
+    last_sched_reserve_stats = {};
+    record_sched_reserve_stats = true;
+    struct record_guard {
+        bool & active;
+        ~record_guard() { active = false; }
+    } guard = { record_sched_reserve_stats };
+    const int64_t reserve_start_us = ggml_time_us();
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
-    synchronize();
+    const int64_t synchronize_start_us = ggml_time_us();
+    if (&runtime == runtime_active.get()) {
+        synchronize();
+    } else if (runtime.sched) {
+        ggml_backend_sched_synchronize(runtime.sched.get());
+    }
+    last_sched_reserve_stats.synchronize_us = ggml_time_us() - synchronize_start_us;
 
     const int64_t t_start_us = ggml_time_us();
+    const int64_t setup_start_us = t_start_us;
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
@@ -875,26 +1384,33 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    runtime.gf_res_prev.reset(new llm_graph_result(max_nodes));
+    runtime.gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    runtime.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
-        mctx = memory->init_full();
+        if (auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get()); mem && runtime.memory_view) {
+            mctx = mem->init_full(runtime.memory_view);
+        } else {
+            mctx = memory->init_full();
+        }
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory module");
         }
     }
+    last_sched_reserve_stats.setup_us = ggml_time_us() - setup_start_us;
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
-    resolve_fused_ops(mctx.get(), n_seqs);
+    const int64_t fused_probe_start_us = ggml_time_us();
+    resolve_fused_ops(runtime, mctx.get(), n_seqs);
+    last_sched_reserve_stats.fused_probe_us = ggml_time_us() - fused_probe_start_us;
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -907,32 +1423,32 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+        auto * gf = graph_reserve(runtime, n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+                model.hparams.no_alloc, model.hparams.no_alloc ? runtime.backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                runtime.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                gf = graph_reserve(runtime, n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
         }
 
-        n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+        n_splits_pp = ggml_backend_sched_get_n_splits(runtime.sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(runtime, n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
 
-        n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
+        n_splits_tg = ggml_backend_sched_get_n_splits(runtime.sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
@@ -945,10 +1461,10 @@ void llama_context::sched_reserve() {
             case LLM_ARCH_MINIMAX_01:
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(runtime, n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(runtime, n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         };
 
         if (!gf) {
@@ -960,12 +1476,12 @@ void llama_context::sched_reserve() {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
         if (!model.hparams.no_alloc) {
-            backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            runtime.backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(runtime.sched.get(), backend);
         }
-        if (backend_buf_exp_size[i] > 1) {
+        if (runtime.backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
-                    backend_buf_exp_size[i] / 1024.0 / 1024.0);
+                    runtime.backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
 
@@ -982,17 +1498,26 @@ void llama_context::sched_reserve() {
     }
 
     const int64_t t_end_us = ggml_time_us();
+    last_sched_reserve_stats.total_us = t_end_us - reserve_start_us;
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
-            __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+            __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(runtime.sched.get()));
+    LLAMA_LOG_INFO("%s: phases sync/setup/fused/input/build/validation/backend/total = %.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f ms, graph reserves = %u, validation builds = %u\n",
+            __func__, last_sched_reserve_stats.synchronize_us/1000.0, last_sched_reserve_stats.setup_us/1000.0,
+            last_sched_reserve_stats.fused_probe_us/1000.0, last_sched_reserve_stats.graph_input_us/1000.0,
+            last_sched_reserve_stats.graph_build_us/1000.0, last_sched_reserve_stats.validation_graph_build_us/1000.0,
+            last_sched_reserve_stats.backend_plan_us/1000.0, last_sched_reserve_stats.total_us/1000.0,
+            last_sched_reserve_stats.graph_reserve_calls, last_sched_reserve_stats.validation_graph_builds);
+    runtime.reserve_ready = true;
 }
 
 void llama_context::synchronize() {
-    if (!sched) {
+    auto & runtime = active_runtime();
+    if (!runtime.sched) {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    ggml_backend_sched_synchronize(runtime.sched.get());
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1030,7 +1555,7 @@ const llama_cparams & llama_context::get_cparams() const {
 }
 
 ggml_backend_sched_t llama_context::get_sched() const {
-    return sched.get();
+    return active_runtime().sched.get();
 }
 
 uint32_t llama_context::n_ctx() const {
@@ -1093,7 +1618,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        active_runtime().gf_res_prev->reset();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1459,7 +1984,7 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
-    sched_need_reserve = true;
+    active_runtime().sched_need_reserve = true;
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -1475,7 +2000,7 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    sched_need_reserve = true;
+    active_runtime().sched_need_reserve = true;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -1496,7 +2021,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return true;
     }
 
-    if (sampler && !layer_devices.empty()) {
+    if (sampler && !active_runtime().layer_devices.empty()) {
         LLAMA_LOG_ERROR("%s: backend sampling is disabled with experimental layer placement\n", __func__);
         return false;
     }
@@ -1510,7 +2035,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            active_runtime().sched_need_reserve = true;
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -1529,7 +2054,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        active_runtime().sched_need_reserve = true;
 
         return true;
     }
@@ -1538,7 +2063,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            active_runtime().sched_need_reserve = true;
         }
 
         sampling.samplers.erase(seq_id);
@@ -1548,7 +2073,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    active_runtime().sched_need_reserve = true;
 
     return true;
 }
@@ -1559,7 +2084,7 @@ bool llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
         return true;
     }
-    if (!layer_devices.empty()) {
+    if (!active_runtime().layer_devices.empty()) {
         for (size_t i = 0; i < n_adapters; ++i) {
             if (scales[i] != 0.0f) {
                 LLAMA_LOG_ERROR("%s: runtime adapters are disabled with experimental layer placement\n", __func__);
@@ -1576,7 +2101,7 @@ bool llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         }
     }
 
-    sched_need_reserve = true;
+    active_runtime().sched_need_reserve = true;
     return true;
 }
 
@@ -1614,31 +2139,40 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
-    if (!layer_devices.empty() && data != nullptr) {
+    if (!active_runtime().layer_devices.empty() && data != nullptr) {
         LLAMA_LOG_ERROR("%s: runtime control vectors are disabled with experimental layer placement\n", __func__);
         return false;
     }
 
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
-    sched_need_reserve = true;
+    active_runtime().sched_need_reserve = true;
 
     return res;
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    return process_ubatch(active_runtime(), ubatch, gtype, mctx, ret);
+}
+
+llm_graph_result * llama_context::process_ubatch(
+        placement_runtime & runtime,
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
+    auto * res = runtime.gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(runtime, res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1647,15 +2181,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_synchronize(runtime.sched.get());
         }
 
         n_reused++;
     } else {
         res->reset();
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_reset(runtime.sched.get());
+        ggml_backend_sched_set_eval_callback(runtime.sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1669,10 +2203,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (!ggml_backend_sched_alloc_graph(runtime.sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+        if (runtime.replay_end >= 0) {
+            validate_layer_backends(*res, runtime);
+            if (res->get_logits()) {
+                throw std::runtime_error("replay graph contains an LM head");
+            }
         }
     }
 
@@ -1686,7 +2226,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(runtime, res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1783,7 +2323,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract logits
     if (logits.data && t_logits) {
-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(active_runtime().sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
@@ -1792,7 +2332,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract embeddings
     if (embd.data && t_embd) {
-        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(active_runtime().sched.get(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
         switch (cparams.pooling_type) {
@@ -1847,7 +2387,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract nextn embeddings (hidden state before the final output norm)
     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(active_runtime().sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
         const uint32_t n_embd = hparams.n_embd_out();
@@ -2119,6 +2659,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        if (!process_shadow_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type))) {
+            LLAMA_LOG_WARN("%s: shadow migration runtime became invalid; active decode continues\n", __func__);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -2153,6 +2697,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // plot the computation graph in dot format (for debugging purposes)
+        try {
+            record_migration_hidden(ubatch, *res);
+        } catch (const std::exception & error) {
+            migration_pending->journal_valid = false;
+            runtime_candidate->state_ready = false;
+            LLAMA_LOG_WARN("%s: hidden capture failed: %s\n", __func__, error.what());
+        }
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
@@ -2167,7 +2718,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(active_runtime().sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
@@ -2182,7 +2733,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(active_runtime().sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
             switch (cparams.pooling_type) {
@@ -2250,7 +2801,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(active_runtime().sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd  = hparams.n_embd_out();
@@ -2265,10 +2816,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, active_runtime().sched.get());
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, active_runtime().sched.get(), &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, active_runtime().sched.get(), &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, active_runtime().sched.get(), &sampling.candidates_count);
         }
 
         n_outputs_prev += n_outputs;
@@ -2519,7 +3070,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(active_runtime().sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
     }
@@ -2647,7 +3198,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
-    return static_cast<llm_graph_result *>(gf_res_reserve.get());
+    return active_runtime().gf_res_reserve.get();
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -2709,6 +3260,17 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    return graph_reserve(active_runtime(), n_tokens, n_seqs, n_outputs, mctx, split_only, sizes);
+}
+
+ggml_cgraph * llama_context::graph_reserve(
+        placement_runtime & runtime,
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    const bool record_stats = record_sched_reserve_stats;
+    const int64_t input_start_us = record_stats ? ggml_time_us() : 0;
+    if (record_stats) {
+        last_sched_reserve_stats.graph_reserve_calls++;
+    }
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2717,10 +3279,10 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
-    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_reset(runtime.sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    runtime.gf_res_prev->reset();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -2733,37 +3295,61 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
-    auto * res = gf_res_reserve.get();
+    auto * res = runtime.gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(runtime, res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
 
+    const int64_t build_start_us = record_stats ? ggml_time_us() : 0;
+    if (record_stats) {
+        last_sched_reserve_stats.graph_input_us += build_start_us - input_start_us;
+    }
     auto * gf = model.build_graph(gparams);
+    if (record_stats) {
+        last_sched_reserve_stats.graph_build_us += ggml_time_us() - build_start_us;
+    }
 
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
     if (split_only) {
+        const int64_t backend_start_us = record_stats ? ggml_time_us() : 0;
         if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            ggml_backend_sched_reserve_size(runtime.sched.get(), gf, sizes);
         } else {
-            ggml_backend_sched_split_graph(sched.get(), gf);
+            ggml_backend_sched_split_graph(runtime.sched.get(), gf);
+        }
+        if (record_stats) {
+            last_sched_reserve_stats.backend_plan_us += ggml_time_us() - backend_start_us;
         }
     } else {
-        if (!layer_devices.empty()) {
+        if (!runtime.layer_devices.empty()) {
             auto validation = std::make_unique<llm_graph_result>(res->get_max_nodes());
             auto validation_params = gparams;
             validation_params.res = validation.get();
+            const int64_t validation_start_us = record_stats ? ggml_time_us() : 0;
             model.build_graph(validation_params);
-            ggml_backend_sched_split_graph(sched.get(), validation->get_gf());
-            validate_layer_backends(*validation);
-            ggml_backend_sched_reset(sched.get());
+            if (record_stats) {
+                last_sched_reserve_stats.validation_graph_builds++;
+                last_sched_reserve_stats.validation_graph_build_us += ggml_time_us() - validation_start_us;
+            }
+            const int64_t backend_start_us = record_stats ? ggml_time_us() : 0;
+            ggml_backend_sched_split_graph(runtime.sched.get(), validation->get_gf());
+            validate_layer_backends(*validation, runtime);
+            ggml_backend_sched_reset(runtime.sched.get());
+            if (record_stats) {
+                last_sched_reserve_stats.backend_plan_us += ggml_time_us() - backend_start_us;
+            }
         }
-        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+        const int64_t backend_start_us = record_stats ? ggml_time_us() : 0;
+        if (!ggml_backend_sched_reserve(runtime.sched.get(), gf)) {
             GGML_ASSERT(!sizes);
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
             return nullptr;
+        }
+        if (record_stats) {
+            last_sched_reserve_stats.backend_plan_us += ggml_time_us() - backend_start_us;
         }
     }
 
@@ -2771,6 +3357,7 @@ ggml_cgraph * llama_context::graph_reserve(
 }
 
 llm_graph_params llama_context::graph_params(
+              const placement_runtime & runtime,
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
@@ -2781,7 +3368,7 @@ llm_graph_params llama_context::graph_params(
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
+        /*.sched       =*/ runtime.sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
@@ -2789,14 +3376,25 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ graph_get_cb(runtime),
         /*.res         =*/ res,
-        /*.active_layers =*/ active_layers.empty() ? nullptr : &active_layers,
-        /*.placement_epoch =*/ placement_epoch,
+        /*.active_layers =*/ runtime.layers.empty() ? nullptr : &runtime.layers,
+        /*.placement_epoch =*/ runtime.placement_epoch,
+        /*.replay_first =*/ runtime.replay_first,
+        /*.replay_end =*/ runtime.replay_end,
+        /*.capture_layer =*/ &runtime == runtime_active.get() && migration_pending &&
+            migration_pending->replay_enabled && migration_pending->journal_valid ? migration_pending->first : -1,
     };
 }
 
 ggml_status llama_context::graph_compute(
+            ggml_cgraph * gf,
+                   bool   batched) {
+    return graph_compute(active_runtime(), gf, batched);
+}
+
+ggml_status llama_context::graph_compute(
+            placement_runtime & runtime,
             ggml_cgraph * gf,
                    bool   batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
@@ -2815,7 +3413,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    auto status = ggml_backend_sched_graph_compute_async(runtime.sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -2825,8 +3423,17 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+llm_graph_cb llama_context::graph_get_cb(const placement_runtime & runtime) const {
+    return [&, runtime_ptr = &runtime](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+        if (runtime_ptr->replay_end >= 0 && strcmp(name, "inp_embd") == 0) {
+            const auto device = runtime_ptr->layer_devices.at(runtime_ptr->replay_first);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == device) {
+                    ggml_backend_sched_set_tensor_backend(runtime_ptr->sched.get(), cur, backend.get());
+                    break;
+                }
+            }
+        }
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -2839,11 +3446,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
-                const auto dev_layer = get_layer_device(il);
+                const auto dev_layer = runtime_ptr->layer_devices.empty() ? model.dev_layer(il) : runtime_ptr->layer_devices.at(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(runtime_ptr->sched.get(), cur, backend.get());
                         }
                     }
                 }
@@ -3676,14 +4283,14 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(active_runtime().sched.get(), backend);
+            ret[buft].compute += active_runtime().backend_buf_exp_size[i];
         }
     } else {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(active_runtime().sched.get(), backend);
+            ret[buft].compute += ggml_backend_sched_get_buffer_size(active_runtime().sched.get(), backend);
         }
     }
     return ret;
@@ -3722,11 +4329,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         cparams.flash_attn = false;
 
         // the graph changes without flash attention, need to reserve again
-        sched_need_reserve = true;
+        active_runtime().sched_need_reserve = true;
         sched_reserve();
     }
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    ggml_opt_params opt_params = ggml_opt_default_params(active_runtime().sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
@@ -3823,9 +4430,9 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = gf_res_prev.get();
+            auto * res = active_runtime().gf_res_prev.get();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+            const auto gparams = graph_params(active_runtime(), res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             res->reset();
 

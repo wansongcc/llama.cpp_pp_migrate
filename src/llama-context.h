@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -40,6 +41,41 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+struct llama_layer_migration_stats {
+    size_t kv_bytes = 0;
+    size_t kv_valid_bytes = 0;
+    size_t recurrent_bytes = 0;
+    int64_t synchronize_us = 0;
+    int64_t prepare_us = 0;
+    int64_t copy_us = 0;
+    int64_t switch_us = 0;
+    int64_t reserve_us = 0;
+    int64_t total_us = 0;
+    size_t journal_bytes = 0;
+    size_t journal_peak_bytes = 0;
+    size_t replay_compute_bytes = 0;
+    size_t replay_tokens = 0;
+    size_t replay_layer_tokens = 0;
+    int64_t journal_us = 0;
+    int64_t replay_us = 0;
+    std::vector<int64_t> replay_step_us;
+    size_t shadow_shared_bytes = 0;
+    int64_t shadow_us = 0;
+};
+
+struct llama_sched_reserve_stats {
+    uint32_t graph_reserve_calls = 0;
+    uint32_t validation_graph_builds = 0;
+    int64_t synchronize_us = 0;
+    int64_t setup_us = 0;
+    int64_t fused_probe_us = 0;
+    int64_t graph_input_us = 0;
+    int64_t graph_build_us = 0;
+    int64_t validation_graph_build_us = 0;
+    int64_t backend_plan_us = 0;
+    int64_t total_us = 0;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -66,6 +102,17 @@ struct llama_context {
 
     // Synchronous reference for the experimental layer migration path.
     void migrate_layers_sync(int32_t first, int32_t end, ggml_backend_dev_t destination, bool fail_after_switch = false);
+
+    uint64_t migrate_layers_async_begin(int32_t first, int32_t end, ggml_backend_dev_t destination);
+    bool migrate_layers_async_commit(uint64_t request_id, bool fail_after_switch = false);
+    void migrate_layers_async_cancel(uint64_t request_id);
+    bool enable_layer_migration_shadow(uint64_t request_id);
+    bool warmup_layer_migration_candidate(uint64_t request_id, uint32_t n_steps = 3);
+    bool enable_layer_migration_replay(uint64_t request_id, size_t capacity_tokens);
+    bool replay_layer_migration(uint64_t request_id, int32_t fail_after_tokens = -1);
+
+    const llama_layer_migration_stats & get_last_layer_migration_stats() const;
+    const llama_sched_reserve_stats & get_last_sched_reserve_stats() const;
 
     ggml_backend_sched_t get_sched() const;
 
@@ -261,21 +308,85 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    struct placement_runtime {
+        std::vector<ggml_backend_dev_t> layer_devices;
+        std::vector<const llama_layer *> layers;
+        llama_memory_hybrid::execution_view_ptr memory_view;
+        uint64_t placement_epoch = 0;
+        uint64_t generation = 0;
+        uint64_t state_frontier = 0;
+        bool state_ready = false;
+        bool reserve_ready = false;
+        bool graph_ready = false;
+        bool sched_need_reserve = true;
+        int32_t replay_first = 0;
+        int32_t replay_end = -1;
+
+        ggml_backend_sched_ptr sched;
+        std::vector<size_t> backend_buf_exp_size;
+        llm_graph_result_ptr gf_res_prev;
+        llm_graph_result_ptr gf_res_reserve;
+    };
+
+    struct pending_migration {
+        uint64_t request_id = 0;
+        uint64_t source_generation = 0;
+        uint64_t frontier = 0;
+        int32_t first = 0;
+        int32_t end = 0;
+        ggml_backend_dev_t source = nullptr;
+        ggml_backend_dev_t destination = nullptr;
+        llama_memory_hybrid::execution_view_ptr candidate_view;
+        std::vector<llama_memory_layer_move_ptr> moves;
+        int64_t total_start_us = 0;
+        bool shadow_enabled = false;
+        bool replay_enabled = false;
+        bool journal_valid = true;
+        size_t journal_capacity = 0;
+        uint64_t source_view_generation = 0;
+        struct hidden_entry {
+            std::vector<float> hidden;
+            std::vector<llama_pos> positions;
+            llama_token token = LLAMA_TOKEN_NULL;
+            bool has_token = false;
+        };
+        std::vector<hidden_entry> journal;
+        std::unique_ptr<placement_runtime> replay_runtime;
+    };
+
+    placement_runtime & active_runtime();
+    const placement_runtime & active_runtime() const;
+
     void validate_layer_devices(const std::vector<ggml_backend_dev_t> & devices) const;
-    void validate_layer_backends(const llm_graph_result & result) const;
+    void validate_layer_backends(const llm_graph_result & result, const placement_runtime & runtime) const;
     void validate_candidate_backends();
 
+    void sched_reserve(placement_runtime & runtime);
+    llm_graph_result * process_ubatch(
+                placement_runtime & runtime,
+                const llama_ubatch & ubatch,
+                    llm_graph_type gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+    ggml_status graph_compute(placement_runtime & runtime, ggml_cgraph * gf, bool batched);
+    bool process_shadow_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype);
+    void record_migration_hidden(const llama_ubatch & ubatch, const llm_graph_result & result);
+    ggml_cgraph * graph_reserve(
+        placement_runtime & runtime,
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+
     llm_graph_params graph_params(
+              const placement_runtime & runtime,
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(const placement_runtime & runtime) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
-    void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
+    void resolve_fused_ops(placement_runtime & runtime, const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -291,10 +402,16 @@ private:
     const llama_model & model;
     std::unique_ptr<llama_model_context_guard> model_context_guard;
 
-    std::vector<ggml_backend_dev_t> layer_devices;
     std::vector<std::vector<ggml_backend_dev_t>> validated_layer_placements;
-    std::vector<const llama_layer *> active_layers;
-    uint64_t placement_epoch = 0;
+    std::unique_ptr<placement_runtime> runtime_active;
+    std::unique_ptr<placement_runtime> runtime_candidate;
+    std::unique_ptr<placement_runtime> runtime_rollback;
+    std::unique_ptr<pending_migration> migration_pending;
+    uint64_t next_runtime_generation = 1;
+    uint64_t next_migration_request_id = 1;
+    llama_layer_migration_stats last_layer_migration_stats;
+    llama_sched_reserve_stats last_sched_reserve_stats;
+    bool record_sched_reserve_stats = false;
 
     llama_cparams cparams;
 
@@ -358,10 +475,6 @@ private:
 
     std::vector<swap_info> output_swaps;
 
-    ggml_backend_sched_ptr sched;
-
-    bool sched_need_reserve = true;
-
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -379,10 +492,6 @@ private:
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
-    std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
-
-    llm_graph_result_ptr gf_res_prev;
-    llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

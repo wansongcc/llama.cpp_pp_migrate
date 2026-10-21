@@ -1431,6 +1431,14 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
+    uint64_t cuda_graph_direct_evaluations = 0;
+    uint64_t cuda_graph_warmup_completions = 0;
+    uint64_t cuda_graph_warmup_resets = 0;
+    uint64_t cuda_graph_captures = 0;
+    uint64_t cuda_graph_instantiations = 0;
+    uint64_t cuda_graph_updates = 0;
+    uint64_t cuda_graph_launches = 0;
+    uint64_t cuda_graph_evictions = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
@@ -1441,6 +1449,7 @@ struct ggml_backend_cuda_context {
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
+                    cuda_graph_evictions++;
                 } else {
                     ++it;
                 }

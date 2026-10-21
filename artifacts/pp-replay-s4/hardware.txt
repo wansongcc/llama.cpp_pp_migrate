@@ -1,0 +1,5 @@
+index, name, uuid, memory.total [MiB], driver_version
+0, Tesla T4, GPU-7f68ab30-52b2-7d89-537f-a57bdf6ec9b8, 15360 MiB, 570.211.01
+1, Tesla T4, GPU-ffc54436-7dea-6bae-f384-7d11a714072f, 15360 MiB, 570.211.01
+2, Tesla T4, GPU-6b3393e8-f16a-15be-00aa-53ce15a2805a, 15360 MiB, 570.211.01
+3, Tesla T4, GPU-8c29bb83-69f9-4e0b-4d61-ee0abc759877, 15360 MiB, 570.211.01

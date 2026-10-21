@@ -86,8 +86,15 @@ llama_kv_cache::llama_kv_cache(
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     independent_layers(independent_layers),
     other(static_cast<llama_kv_cache *>(mem_other)),
-    v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    active_metadata([&]() {
+        auto result = std::make_shared<metadata>();
+        result->v_cells = other ? other->active_metadata->v_cells : std::make_shared<llama_kv_cells_vec>();
+        return result;
+    }()),
+    v_heads(active_metadata->v_heads),
+    v_cells(*active_metadata->v_cells),
+    seq_to_stream(active_metadata->seq_to_stream),
+    sc_info(active_metadata->sc_info) {
 
     if (independent_layers && (other || reuse || share || hparams.no_alloc)) {
         throw std::runtime_error("independent KV cache layers do not support sharing, reuse, or no_alloc");
@@ -309,6 +316,12 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(storage.buf.get()), ggml_backend_buffer_get_size(storage.buf.get())/1024.0/1024.0);
             ggml_backend_buffer_clear(storage.buf.get(), 0);
         }
+
+        layer_banks.resize(layers.size());
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const auto dev = ggml_backend_buft_get_device(layers[i].storage->buft);
+            layer_banks[i].emplace(dev, layers[i]);
+        }
     } else {
         for (auto & [buft, ctx] : ctx_map) {
             ggml_backend_buffer_t buf;
@@ -404,8 +417,8 @@ llama_kv_cache::llama_kv_cache(
 }
 
 struct llama_kv_cache::layer_move final : llama_memory_layer_move {
-    layer_move(llama_kv_cache & mem, size_t i_layer, kv_layer && layer) :
-        mem(mem), i_layer(i_layer), layer(std::move(layer)) {
+    layer_move(llama_kv_cache & mem, size_t i_layer, kv_layer && layer, size_t bytes, size_t valid_bytes, int64_t copy_us) :
+        mem(mem), i_layer(i_layer), layer(std::move(layer)), bytes(bytes), valid_bytes(valid_bytes), copy_time_us(copy_us) {
     }
 
     void swap() noexcept override {
@@ -417,9 +430,64 @@ struct llama_kv_cache::layer_move final : llama_memory_layer_move {
         std::swap(active.storage, layer.storage);
     }
 
+    void copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst) override {
+        const int64_t start_us = ggml_time_us();
+        source_backend = backend_src;
+        destination_backend = backend_dst;
+        ggml_backend_tensor_copy_async(backend_src, backend_dst, mem.layers[i_layer].k, layer.k);
+        if (mem.layers[i_layer].v) {
+            ggml_backend_tensor_copy_async(backend_src, backend_dst, mem.layers[i_layer].v, layer.v);
+        }
+        source_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend_src)));
+        destination_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend_dst)));
+        if (source_event) {
+            ggml_backend_event_record(source_event.get(), backend_src);
+        }
+        if (destination_event) {
+            ggml_backend_event_record(destination_event.get(), backend_dst);
+        }
+        copy_time_us = ggml_time_us() - start_us;
+    }
+
+    void wait() override {
+        if (source_event) {
+            ggml_backend_event_synchronize(source_event.get());
+        } else if (source_backend) {
+            ggml_backend_synchronize(source_backend);
+        }
+        if (destination_event) {
+            ggml_backend_event_synchronize(destination_event.get());
+        } else if (destination_backend && destination_backend != source_backend) {
+            ggml_backend_synchronize(destination_backend);
+        }
+    }
+
+    size_t kv_bytes() const noexcept override {
+        return bytes;
+    }
+
+    size_t kv_valid_bytes() const noexcept override {
+        return valid_bytes;
+    }
+
+    size_t recurrent_bytes() const noexcept override {
+        return 0;
+    }
+
+    int64_t copy_us() const noexcept override {
+        return copy_time_us;
+    }
+
     llama_kv_cache & mem;
     size_t i_layer;
     kv_layer layer;
+    size_t bytes;
+    size_t valid_bytes;
+    int64_t copy_time_us;
+    ggml_backend_t source_backend = nullptr;
+    ggml_backend_t destination_backend = nullptr;
+    ggml_backend_event_ptr source_event;
+    ggml_backend_event_ptr destination_event;
 };
 
 void llama_kv_cache::clear(bool data) {
@@ -442,6 +510,14 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm(*active_metadata, seq_id, p0, p1);
+}
+
+bool llama_kv_cache::seq_rm(metadata & metadata, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    auto & v_heads = metadata.v_heads;
+    auto & v_cells = *metadata.v_cells;
+    const auto & seq_to_stream = metadata.seq_to_stream;
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -747,9 +823,11 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     if (independent_layers) {
-        for (const auto & layer : layers) {
-            const auto & buf = layer.storage->buf;
-            ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        for (const auto & banks : layer_banks) {
+            for (const auto & entry : banks) {
+                const auto & buf = entry.second.storage->buf;
+                ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+            }
         }
         return ret;
     }
@@ -819,6 +897,13 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    return prepare(*active_metadata, ubatches);
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(metadata & metadata, const std::vector<llama_ubatch> & ubatches) {
+    auto & v_heads = metadata.v_heads;
+    auto & v_cells = *metadata.v_cells;
+
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -836,7 +921,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        const auto sinfo_new = find_slot(metadata, ubatch, false);
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -859,7 +944,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(metadata, sinfo_new, ubatch);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -966,6 +1051,13 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+    return find_slot(*active_metadata, ubatch, cont);
+}
+
+llama_kv_cache::slot_info llama_kv_cache::find_slot(const metadata & metadata, const llama_ubatch & ubatch, bool cont) const {
+    const auto & v_heads = metadata.v_heads;
+    const auto & v_cells = *metadata.v_cells;
+    const auto & seq_to_stream = metadata.seq_to_stream;
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -1165,6 +1257,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    apply_ubatch(*active_metadata, sinfo, ubatch);
+}
+
+void llama_kv_cache::apply_ubatch(metadata & metadata, const slot_info & sinfo, const llama_ubatch & ubatch) {
+    auto & v_heads = metadata.v_heads;
+    auto & v_cells = *metadata.v_cells;
+    const auto & seq_to_stream = metadata.seq_to_stream;
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1243,7 +1343,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            seq_rm(metadata, s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
         }
     }
 
@@ -1314,13 +1414,37 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+llama_kv_cache::metadata_ptr llama_kv_cache::get_active_metadata() const {
+    return active_metadata;
+}
+
+llama_kv_cache::metadata_ptr llama_kv_cache::clone_active_metadata() const {
+    auto result = std::make_shared<metadata>(*active_metadata);
+    result->v_cells = std::make_shared<llama_kv_cells_vec>(*active_metadata->v_cells);
+    return result;
+}
+
 std::vector<ggml_tensor *> llama_kv_cache::layer_state_tensors(int32_t il) const {
+    return layer_state_tensors(il, nullptr);
+}
+
+const llama_kv_cache::kv_layer & llama_kv_cache::layer_for_device(int32_t ikv, ggml_backend_dev_t dev) const {
+    const auto & active = layers.at(ikv);
+    if (!dev || layer_banks.empty()) {
+        return active;
+    }
+    const auto active_dev = active.storage ? ggml_backend_buft_get_device(active.storage->buft) : nullptr;
+    const auto bank = layer_banks.at(ikv).find(dev);
+    return dev == active_dev || bank == layer_banks.at(ikv).end() ? active : bank->second;
+}
+
+std::vector<ggml_tensor *> llama_kv_cache::layer_state_tensors(int32_t il, ggml_backend_dev_t dev) const {
     const auto it = map_layer_ids.find(il);
     if (it == map_layer_ids.end()) {
         return {};
     }
 
-    const auto & layer = layers[it->second];
+    const auto & layer = layer_for_device(it->second, dev);
     std::vector<ggml_tensor *> result;
     if (layer.k) {
         result.push_back(layer.k);
@@ -1347,50 +1471,67 @@ llama_memory_layer_move_ptr llama_kv_cache::prepare_layer_move(int32_t il, ggml_
     const size_t i_layer = it->second;
     const auto & src = layers[i_layer];
 
-    ggml_init_params params = {
-        /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
+    auto & banks = layer_banks[i_layer];
+    auto bank = banks.find(dev);
+    if (bank == banks.end()) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
 
-    kv_layer dst = { src.il, nullptr, nullptr, {}, {}, std::make_shared<layer_storage>(), };
-    dst.storage->ctx.reset(ggml_init(params));
-    dst.storage->buft = ggml_backend_dev_buffer_type(dev);
-    if (!dst.storage->ctx || !dst.storage->buft) {
-        throw std::runtime_error("failed to create KV cache layer destination");
-    }
+        kv_layer dst = { src.il, nullptr, nullptr, {}, {}, std::make_shared<layer_storage>(), };
+        dst.storage->ctx.reset(ggml_init(params));
+        dst.storage->buft = ggml_backend_dev_buffer_type(dev);
+        if (!dst.storage->ctx || !dst.storage->buft) {
+            throw std::runtime_error("failed to create KV cache layer destination");
+        }
 
-    auto * ctx = dst.storage->ctx.get();
-    dst.k = ggml_dup_tensor(ctx, src.k);
-    memcpy(dst.k->nb, src.k->nb, sizeof(dst.k->nb));
-    ggml_set_name(dst.k, ggml_get_name(src.k));
+        auto * ctx = dst.storage->ctx.get();
+        dst.k = ggml_dup_tensor(ctx, src.k);
+        memcpy(dst.k->nb, src.k->nb, sizeof(dst.k->nb));
+        ggml_set_name(dst.k, ggml_get_name(src.k));
 
-    if (src.v) {
-        dst.v = ggml_dup_tensor(ctx, src.v);
-        memcpy(dst.v->nb, src.v->nb, sizeof(dst.v->nb));
-        ggml_set_name(dst.v, ggml_get_name(src.v));
-    }
-
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        const auto * k_stream = src.k_stream[s];
-        dst.k_stream.push_back(ggml_view_2d(ctx, dst.k, k_stream->ne[0], k_stream->ne[1], k_stream->nb[1], k_stream->view_offs));
         if (src.v) {
-            const auto * v_stream = src.v_stream[s];
-            dst.v_stream.push_back(ggml_view_2d(ctx, dst.v, v_stream->ne[0], v_stream->ne[1], v_stream->nb[1], v_stream->view_offs));
+            dst.v = ggml_dup_tensor(ctx, src.v);
+            memcpy(dst.v->nb, src.v->nb, sizeof(dst.v->nb));
+            ggml_set_name(dst.v, ggml_get_name(src.v));
+        }
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto * k_stream = src.k_stream[s];
+            dst.k_stream.push_back(ggml_view_2d(ctx, dst.k, k_stream->ne[0], k_stream->ne[1], k_stream->nb[1], k_stream->view_offs));
+            if (src.v) {
+                const auto * v_stream = src.v_stream[s];
+                dst.v_stream.push_back(ggml_view_2d(ctx, dst.v, v_stream->ne[0], v_stream->ne[1], v_stream->nb[1], v_stream->view_offs));
+            }
+        }
+
+        dst.storage->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, dst.storage->buft));
+        if (!dst.storage->buf) {
+            throw std::runtime_error("failed to allocate KV cache layer destination");
+        }
+        ggml_backend_buffer_clear(dst.storage->buf.get(), 0);
+
+        bank = banks.emplace(dev, std::move(dst)).first;
+    }
+
+    kv_layer dst = bank->second;
+    if (dst.k == src.k) {
+        throw std::invalid_argument("KV cache layer destination is already active");
+    }
+
+    const size_t bytes = ggml_nbytes(src.k) + (src.v ? ggml_nbytes(src.v) : 0);
+    size_t valid_bytes = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const size_t n_valid = v_cells[s].get_used();
+        valid_bytes += n_valid*ggml_row_size(src.k_stream[s]->type, src.k_stream[s]->ne[0]);
+        if (src.v_stream[s]) {
+            valid_bytes += n_valid*ggml_row_size(src.v_stream[s]->type, src.v_stream[s]->ne[0]);
         }
     }
 
-    dst.storage->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, dst.storage->buft));
-    if (!dst.storage->buf) {
-        throw std::runtime_error("failed to allocate KV cache layer destination");
-    }
-
-    ggml_backend_tensor_copy(src.k, dst.k);
-    if (src.v) {
-        ggml_backend_tensor_copy(src.v, dst.v);
-    }
-
-    return std::make_unique<layer_move>(*this, i_layer, std::move(dst));
+    return std::make_unique<layer_move>(*this, i_layer, std::move(dst), bytes, valid_bytes, 0);
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
@@ -1400,6 +1541,12 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    return get_n_kv(*active_metadata, sinfo);
+}
+
+uint32_t llama_kv_cache::get_n_kv(const metadata & metadata, const slot_info & sinfo) const {
+    const auto & v_cells = *metadata.v_cells;
+
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -1416,9 +1563,13 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    return get_k(ctx, il, n_kv, sinfo, nullptr);
+}
+
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_backend_dev_t dev) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * k = layers[ikv].k;
+    auto * k = layer_for_device(ikv, dev).k;
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -1436,9 +1587,13 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    return get_v(ctx, il, n_kv, sinfo, nullptr);
+}
+
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_backend_dev_t dev) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    auto * v = layer_for_device(ikv, dev).v;
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
@@ -1468,11 +1623,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    return cpy_k(ctx, k_cur, k_idxs, il, sinfo, nullptr);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, ggml_backend_dev_t dev) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
 
-    ggml_tensor * k = layers[ikv].k;
+    ggml_tensor * k = layer_for_device(ikv, dev).k;
 
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
@@ -1503,11 +1662,15 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+    return cpy_v(ctx, v_cur, v_idxs, il, sinfo, nullptr);
+}
+
+ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, ggml_backend_dev_t dev) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    auto * v = layer_for_device(ikv, dev).v;
 
     const int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
@@ -1675,6 +1838,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+    set_input_k_shift(*active_metadata, dst);
+}
+
+void llama_kv_cache::set_input_k_shift(const metadata & metadata, ggml_tensor * dst) const {
+    const auto & v_cells = *metadata.v_cells;
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     int32_t * data = (int32_t *) dst->data;
@@ -1894,6 +2063,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    set_input_kq_mask(*active_metadata, dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache::set_input_kq_mask(const metadata & metadata, ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    const auto & v_cells = *metadata.v_cells;
+    const auto & seq_to_stream = metadata.seq_to_stream;
+
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1932,6 +2108,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    set_input_pos_bucket(*active_metadata, dst, ubatch);
+}
+
+void llama_kv_cache::set_input_pos_bucket(const metadata & metadata, ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    const auto & v_cells = *metadata.v_cells;
+
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
@@ -1980,6 +2162,13 @@ bool llama_kv_cache::has_cell_ext() const {
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    get_prev_tokens(*active_metadata, ubatch, n, res);
+}
+
+void llama_kv_cache::get_prev_tokens(const metadata & metadata, const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    const auto & v_cells = *metadata.v_cells;
+    const auto & seq_to_stream = metadata.seq_to_stream;
+
     const uint32_t n_tokens = ubatch.n_tokens;
 
     res.clear();
@@ -2039,8 +2228,10 @@ size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
     if (independent_layers) {
-        for (const auto & layer : layers) {
-            size += ggml_backend_buffer_get_size(layer.storage->buf.get());
+        for (const auto & banks : layer_banks) {
+            for (const auto & entry : banks) {
+                size += ggml_backend_buffer_get_size(entry.second.storage->buf.get());
+            }
         }
         return size;
     }
@@ -2821,7 +3012,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), metadata(kv->get_active_metadata()) {
     n_kv = kv->get_size();
 
     const uint32_t n_stream = kv->get_n_stream();
@@ -2841,7 +3032,7 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_context * lctx,
         bool do_shift,
-        stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
+        stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), metadata(kv->get_active_metadata()), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
     if (!do_shift && this->sc_info.empty()) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
@@ -2850,7 +3041,34 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), metadata(kv->get_active_metadata()), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        llama_kv_cache::metadata_ptr metadata,
+        llama_kv_cache::slot_info_vec_t sinfos,
+        std::vector<llama_ubatch> ubatches,
+        std::vector<ggml_backend_dev_t> layer_devices) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), metadata(std::move(metadata)), layer_devices(std::move(layer_devices)), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+    GGML_ASSERT(this->metadata);
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        llama_kv_cache::metadata_ptr metadata,
+        std::vector<ggml_backend_dev_t> layer_devices) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), metadata(std::move(metadata)), layer_devices(std::move(layer_devices)) {
+    GGML_ASSERT(this->metadata);
+    n_kv = kv->get_size();
+
+    const uint32_t n_stream = kv->get_n_stream();
+    sinfos.resize(1);
+    sinfos[0].s0 = 0;
+    sinfos[0].s1 = n_stream - 1;
+    sinfos[0].idxs.resize(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        sinfos[0].strm.push_back(s);
+        sinfos[0].idxs[s].resize(1, 0);
+    }
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -2875,8 +3093,8 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
-    kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    kv->apply_ubatch(*metadata, sinfos[i_cur], ubatches[i_cur]);
+    n_kv = kv->get_n_kv(*metadata, sinfos[i_cur]);
 
     return true;
 }
@@ -2904,19 +3122,19 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], layer_devices.empty() ? nullptr : layer_devices.at(il));
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], layer_devices.empty() ? nullptr : layer_devices.at(il));
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur], layer_devices.empty() ? nullptr : layer_devices.at(il));
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
-    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur], layer_devices.empty() ? nullptr : layer_devices.at(il));
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -2936,7 +3154,7 @@ ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) cons
 }
 
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
-    kv->set_input_k_shift(dst);
+    kv->set_input_k_shift(*metadata, dst);
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2948,11 +3166,11 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask(*metadata, dst, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    kv->set_input_pos_bucket(dst, ubatch);
+    kv->set_input_pos_bucket(*metadata, dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
@@ -2964,5 +3182,5 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
-    kv->get_prev_tokens(ubatch, n, res);
+    kv->get_prev_tokens(*metadata, ubatch, n, res);
 }

@@ -72,9 +72,30 @@ llama_memory_hybrid::llama_memory_hybrid(
         layer_device,
         independent_layers
     )),
-    independent_layers(independent_layers) {}
+    independent_layers(independent_layers),
+    active_view(std::make_shared<execution_view>(execution_view {
+        mem_attn->get_active_metadata(), mem_recr->get_active_metadata(),
+        [&]() {
+            std::vector<ggml_backend_dev_t> result;
+            if (independent_layers) {
+                result.resize(hparams.n_layer());
+                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                    result[il] = layer_device(il);
+                }
+            }
+            return result;
+        }(),
+        0, 0, true })) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    return init_batch(active_view, balloc, n_ubatch, embd_all);
+}
+
+llama_memory_context_ptr llama_memory_hybrid::init_batch(
+        const execution_view_ptr & view,
+        llama_batch_allocr & balloc,
+        uint32_t n_ubatch,
+        bool embd_all) {
     do {
         balloc.split_reset();
 
@@ -112,28 +133,45 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         }
 
         // prepare the recurrent batches first
-        if (!mem_recr->prepare(ubatches)) {
+        if (!mem_recr->prepare(*view->recurrent, ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
         // prepare the attention cache
-        auto heads_attn = mem_attn->prepare(ubatches);
+        auto heads_attn = mem_attn->prepare(*view->attn, ubatches);
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
         return std::make_unique<llama_memory_hybrid_context>(
-                this, std::move(heads_attn), std::move(ubatches));
+                this, view, std::move(heads_attn), std::move(ubatches));
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_full() {
-    return std::make_unique<llama_memory_hybrid_context>(this);
+    return init_full(active_view);
+}
+
+llama_memory_context_ptr llama_memory_hybrid::init_full(const execution_view_ptr & view) {
+    return std::make_unique<llama_memory_hybrid_context>(this, view);
+}
+
+llama_memory_context_ptr llama_memory_hybrid::init_ubatches(
+        const execution_view_ptr & view,
+        std::vector<llama_ubatch> ubatches) {
+    if (!view || !mem_recr->prepare(*view->recurrent, ubatches)) {
+        return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    auto sinfos = mem_attn->prepare(*view->attn, ubatches);
+    if (sinfos.empty()) {
+        return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    return std::make_unique<llama_memory_hybrid_context>(this, view, std::move(sinfos), std::move(ubatches));
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
@@ -146,9 +184,11 @@ bool llama_memory_hybrid::get_can_shift() const {
 }
 
 void llama_memory_hybrid::clear(bool data) {
+    ++active_view->generation;
     mem_attn->clear(data);
     mem_recr->clear(data);
-    append_only = true;
+    active_view->frontier = 0;
+    active_view->append_only = true;
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -157,32 +197,32 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
-    append_only = false;
+    active_view->append_only = false;
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    append_only = false;
+    active_view->append_only = false;
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
-    append_only = false;
+    active_view->append_only = false;
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
-    append_only = false;
+    active_view->append_only = false;
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
-    append_only = false;
+    active_view->append_only = false;
 }
 
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
@@ -215,11 +255,48 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_attn->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
-    append_only = false;
+    active_view->append_only = false;
 }
 
 bool llama_memory_hybrid::is_append_only() const {
-    return !independent_layers || append_only;
+    return !independent_layers || active_view->append_only;
+}
+
+llama_memory_hybrid::execution_view_ptr llama_memory_hybrid::get_active_view() const {
+    return active_view;
+}
+
+llama_memory_hybrid::execution_view_ptr llama_memory_hybrid::clone_active_view() const {
+    return clone_active_view(active_view->layer_devices);
+}
+
+llama_memory_hybrid::execution_view_ptr llama_memory_hybrid::clone_active_view(const std::vector<ggml_backend_dev_t> & layer_devices) const {
+    return std::make_shared<execution_view>(execution_view {
+        mem_attn->clone_active_metadata(), mem_recr->clone_active_metadata(),
+        layer_devices, active_view->frontier, active_view->generation + 1, active_view->append_only });
+}
+
+void llama_memory_hybrid::exchange_active_view(const execution_view_ptr & candidate, uint64_t expected_frontier) {
+    if (!candidate || candidate->frontier != expected_frontier || active_view->frontier != expected_frontier) {
+        throw std::runtime_error("stale hybrid execution view");
+    }
+
+    std::swap(active_view->attn->v_heads, candidate->attn->v_heads);
+    std::swap(*active_view->attn->v_cells, *candidate->attn->v_cells);
+    std::swap(active_view->attn->seq_to_stream, candidate->attn->seq_to_stream);
+    std::swap(active_view->attn->sc_info, candidate->attn->sc_info);
+
+    std::swap(active_view->recurrent->head, candidate->recurrent->head);
+    std::swap(active_view->recurrent->used, candidate->recurrent->used);
+    std::swap(active_view->recurrent->n, candidate->recurrent->n);
+    std::swap(active_view->recurrent->rs_z, candidate->recurrent->rs_z);
+    std::swap(active_view->recurrent->rs_idx, candidate->recurrent->rs_idx);
+    std::swap(active_view->recurrent->cells, candidate->recurrent->cells);
+
+    std::swap(active_view->layer_devices, candidate->layer_devices);
+    std::swap(active_view->frontier, candidate->frontier);
+    std::swap(active_view->generation, candidate->generation);
+    std::swap(active_view->append_only, candidate->append_only);
 }
 
 std::vector<ggml_tensor *> llama_memory_hybrid::layer_state_tensors(int32_t il) const {
@@ -227,6 +304,14 @@ std::vector<ggml_tensor *> llama_memory_hybrid::layer_state_tensors(int32_t il) 
         return {};
     }
     return hparams.is_recr(il) ? mem_recr->layer_state_tensors(il) : mem_attn->layer_state_tensors(il);
+}
+
+std::vector<ggml_tensor *> llama_memory_hybrid::layer_state_tensors(const execution_view_ptr & view, int32_t il) const {
+    if (!view || il < 0 || (uint32_t) il >= hparams.n_layer()) {
+        return {};
+    }
+    auto * dev = view->layer_devices.empty() ? nullptr : view->layer_devices.at(il);
+    return hparams.is_recr(il) ? mem_recr->layer_state_tensors(il, dev) : mem_attn->layer_state_tensors(il, dev);
 }
 
 llama_memory_layer_move_ptr llama_memory_hybrid::prepare_layer_move(int32_t il, ggml_backend_dev_t dev) {
@@ -247,15 +332,27 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
-    ctx_recr(mem->get_mem_recr()->init_full()),
+    view(mem->get_active_view()),
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), view->attn, view->layer_devices)),
+    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), view->recurrent, view->layer_devices)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_context::llama_memory_hybrid_context(
+        llama_memory_hybrid * mem,
+        llama_memory_hybrid::execution_view_ptr view) :
+    view(std::move(view)),
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), this->view->attn, this->view->layer_devices)),
+    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->view->recurrent, this->view->layer_devices)),
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    GGML_ASSERT(this->view);
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
               llama_context * lctx,
                        bool   optimize) :
+    view(mem->get_active_view()),
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
@@ -266,10 +363,24 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
                   slot_info_vec_t   sinfos_attn,
         std::vector<llama_ubatch>   ubatches) :
     ubatches(std::move(ubatches)),
+    view(mem->get_active_view()),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
-    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), view->attn, std::move(sinfos_attn), this->ubatches, view->layer_devices)),
+    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), view->recurrent, this->ubatches, view->layer_devices)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_context::llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+              llama_memory_hybrid::execution_view_ptr view,
+                  slot_info_vec_t   sinfos_attn,
+        std::vector<llama_ubatch>   ubatches) :
+    ubatches(std::move(ubatches)),
+    view(std::move(view)),
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), this->view->attn, std::move(sinfos_attn), this->ubatches, this->view->layer_devices)),
+    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->view->recurrent, this->ubatches, this->view->layer_devices)),
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    GGML_ASSERT(this->view);
 }
 
 bool llama_memory_hybrid_context::next() {
@@ -292,6 +403,13 @@ bool llama_memory_hybrid_context::apply() {
 
     res = res & ctx_attn->apply();
     res = res & ctx_recr->apply();
+
+    if (res && !ubatches.empty()) {
+        const auto & ubatch = ubatches[i_next];
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            view->frontier = std::max<uint64_t>(view->frontier, uint64_t(ubatch.pos[i]) + 1);
+        }
+    }
 
     return res;
 }

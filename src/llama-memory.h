@@ -77,6 +77,13 @@ struct llama_memory_layer_move {
     virtual ~llama_memory_layer_move() = default;
 
     virtual void swap() noexcept = 0;
+    virtual void copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst) = 0;
+    virtual void wait() = 0;
+
+    virtual size_t kv_bytes() const noexcept = 0;
+    virtual size_t kv_valid_bytes() const noexcept = 0;
+    virtual size_t recurrent_bytes() const noexcept = 0;
+    virtual int64_t copy_us() const noexcept = 0;
 };
 
 using llama_memory_layer_move_ptr = std::unique_ptr<llama_memory_layer_move>;

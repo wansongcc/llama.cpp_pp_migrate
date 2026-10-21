@@ -6,6 +6,7 @@
 
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 //
@@ -16,6 +17,38 @@
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
 public:
+    struct mem_cell {
+        llama_pos pos  = -1;
+        int32_t   src  = -1;
+        int32_t   src0 = -1;
+        int32_t   tail = -1;
+
+        std::set<llama_seq_id> seq_id;
+
+        bool has_seq_id(const llama_seq_id & id) const {
+            return seq_id.find(id) != seq_id.end();
+        }
+
+        bool is_empty() const {
+            return seq_id.empty();
+        }
+
+        bool is_same_seq(const mem_cell & other) const {
+            return seq_id == other.seq_id;
+        }
+    };
+
+    struct metadata {
+        uint32_t head = 0;
+        uint32_t used = 0;
+        uint32_t n = 0;
+        int32_t rs_z = -1;
+        std::vector<uint32_t> rs_idx;
+        std::vector<mem_cell> cells;
+    };
+
+    using metadata_ptr = std::shared_ptr<metadata>;
+
     llama_memory_recurrent(
             const llama_model & model,
                     ggml_type   type_r,
@@ -57,9 +90,11 @@ public:
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
+    bool prepare(metadata & metadata, const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
+    bool find_slot(metadata & metadata, const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
 
@@ -70,48 +105,30 @@ public:
 
     llama_memory_layer_move_ptr prepare_layer_move(int32_t il, ggml_backend_dev_t dev);
     std::vector<ggml_tensor *> layer_state_tensors(int32_t il) const;
+    std::vector<ggml_tensor *> layer_state_tensors(int32_t il, ggml_backend_dev_t dev) const;
 
-    uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
+    metadata_ptr get_active_metadata() const;
+    metadata_ptr clone_active_metadata() const;
+
     uint32_t size = 0; // total number of cells, shared across all sequences
-    uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
-    // per-seq rollback index
-    std::vector<uint32_t> rs_idx;
-
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
-    // computed before each graph build
-    uint32_t n = 0;
+private:
+    friend class llama_memory_recurrent_context;
 
-    // first zero-ed state
-    int32_t rs_z = -1;
+    metadata_ptr active_metadata;
 
-    // TODO: optimize for recurrent state needs
-    struct mem_cell {
-        llama_pos pos  = -1;
-        int32_t   src  = -1; // used to know where states should be copied from
-        int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
-        int32_t   tail = -1;
-
-        std::set<llama_seq_id> seq_id;
-
-        bool has_seq_id(const llama_seq_id & id) const {
-            return seq_id.find(id) != seq_id.end();
-        }
-
-        bool is_empty() const {
-            return seq_id.empty();
-        }
-
-        bool is_same_seq(const mem_cell & other) const {
-            return seq_id == other.seq_id;
-        }
-    };
-
-    std::vector<mem_cell> cells;
+public:
+    uint32_t & head;
+    uint32_t & used;
+    uint32_t & n;
+    int32_t & rs_z;
+    std::vector<uint32_t> & rs_idx;
+    std::vector<mem_cell> & cells;
 
     // per layer
     std::vector<ggml_tensor *> r_l;
@@ -128,6 +145,13 @@ private:
 
     struct layer_move;
 
+    struct layer_bank {
+        ggml_tensor * r;
+        ggml_tensor * s;
+        ggml_tensor * p;
+        std::shared_ptr<layer_storage> storage;
+    };
+
     //const llama_model & model;
     const llama_hparams & hparams;
 
@@ -137,6 +161,8 @@ private:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     std::vector<std::shared_ptr<layer_storage>> layer_storages;
+
+    std::vector<std::unordered_map<ggml_backend_dev_t, layer_bank>> layer_banks;
 
     const bool independent_layers = false;
 
@@ -166,6 +192,17 @@ public:
     llama_memory_recurrent_context(
             llama_memory_recurrent * mem,
             std::vector<llama_ubatch> ubatches);
+
+    llama_memory_recurrent_context(
+            llama_memory_recurrent * mem,
+            llama_memory_recurrent::metadata_ptr metadata,
+            std::vector<llama_ubatch> ubatches,
+            std::vector<ggml_backend_dev_t> layer_devices = {});
+
+    llama_memory_recurrent_context(
+            llama_memory_recurrent * mem,
+            llama_memory_recurrent::metadata_ptr metadata,
+            std::vector<ggml_backend_dev_t> layer_devices);
 
     virtual ~llama_memory_recurrent_context();
 
@@ -198,6 +235,8 @@ private:
     const llama_memory_status status;
 
     llama_memory_recurrent * mem;
+    llama_memory_recurrent::metadata_ptr metadata;
+    std::vector<ggml_backend_dev_t> layer_devices;
 
     size_t i_next = 0;
 

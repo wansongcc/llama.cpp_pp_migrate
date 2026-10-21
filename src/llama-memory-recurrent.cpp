@@ -27,7 +27,17 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter,
     const llama_layer_device_cb & layer_device,
-                     bool   independent_layers) : hparams(model.hparams), n_seq_max(n_seq_max), independent_layers(independent_layers) {
+                     bool   independent_layers) :
+    active_metadata(std::make_shared<metadata>()),
+    head(active_metadata->head),
+    used(active_metadata->used),
+    n(active_metadata->n),
+    rs_z(active_metadata->rs_z),
+    rs_idx(active_metadata->rs_idx),
+    cells(active_metadata->cells),
+    hparams(model.hparams),
+    n_seq_max(n_seq_max),
+    independent_layers(independent_layers) {
     if (independent_layers && hparams.no_alloc) {
         throw std::runtime_error("independent recurrent cache layers do not support no_alloc");
     }
@@ -151,6 +161,15 @@ llama_memory_recurrent::llama_memory_recurrent(
             ggml_backend_buffer_clear(storage->buf.get(), 0);
             LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(storage->buf.get()), ggml_backend_buffer_get_size(storage->buf.get())/1024.0/1024.0);
         }
+
+        layer_banks.resize(layer_storages.size());
+        for (size_t i = 0; i < layer_storages.size(); ++i) {
+            if (!layer_storages[i]) {
+                continue;
+            }
+            const auto dev = ggml_backend_buft_get_device(layer_storages[i]->buft);
+            layer_banks[i].emplace(dev, layer_bank { r_l[i], s_l[i], p_l[i], layer_storages[i] });
+        }
     } else {
         for (auto & [buft, ctx] : ctx_map) {
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
@@ -183,8 +202,10 @@ struct llama_memory_recurrent::layer_move final : llama_memory_layer_move {
                   ggml_tensor *   r,
                   ggml_tensor *   s,
                   ggml_tensor *   p,
-        std::shared_ptr<layer_storage> storage) :
-        mem(mem), il(il), r(r), s(s), p(p), storage(std::move(storage)) {
+        std::shared_ptr<layer_storage> storage,
+                          size_t   bytes,
+                         int64_t   copy_us) :
+        mem(mem), il(il), r(r), s(s), p(p), storage(std::move(storage)), bytes(bytes), copy_time_us(copy_us) {
     }
 
     void swap() noexcept override {
@@ -194,24 +215,97 @@ struct llama_memory_recurrent::layer_move final : llama_memory_layer_move {
         std::swap(mem.layer_storages[il], storage);
     }
 
+    void copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst) override {
+        const int64_t start_us = ggml_time_us();
+        source_backend = backend_src;
+        destination_backend = backend_dst;
+        ggml_backend_tensor_copy_async(backend_src, backend_dst, mem.r_l[il], r);
+        ggml_backend_tensor_copy_async(backend_src, backend_dst, mem.s_l[il], s);
+        if (mem.p_l[il]) {
+            ggml_backend_tensor_copy_async(backend_src, backend_dst, mem.p_l[il], p);
+        }
+        source_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend_src)));
+        destination_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend_dst)));
+        if (source_event) {
+            ggml_backend_event_record(source_event.get(), backend_src);
+        }
+        if (destination_event) {
+            ggml_backend_event_record(destination_event.get(), backend_dst);
+        }
+        copy_time_us = ggml_time_us() - start_us;
+    }
+
+    void wait() override {
+        if (source_event) {
+            ggml_backend_event_synchronize(source_event.get());
+        } else if (source_backend) {
+            ggml_backend_synchronize(source_backend);
+        }
+        if (destination_event) {
+            ggml_backend_event_synchronize(destination_event.get());
+        } else if (destination_backend && destination_backend != source_backend) {
+            ggml_backend_synchronize(destination_backend);
+        }
+    }
+
+    size_t kv_bytes() const noexcept override {
+        return 0;
+    }
+
+    size_t kv_valid_bytes() const noexcept override {
+        return 0;
+    }
+
+    size_t recurrent_bytes() const noexcept override {
+        return bytes;
+    }
+
+    int64_t copy_us() const noexcept override {
+        return copy_time_us;
+    }
+
     llama_memory_recurrent & mem;
     int32_t il;
     ggml_tensor * r;
     ggml_tensor * s;
     ggml_tensor * p;
     std::shared_ptr<layer_storage> storage;
+    size_t bytes;
+    int64_t copy_time_us;
+    ggml_backend_t source_backend = nullptr;
+    ggml_backend_t destination_backend = nullptr;
+    ggml_backend_event_ptr source_event;
+    ggml_backend_event_ptr destination_event;
 };
 
 std::vector<ggml_tensor *> llama_memory_recurrent::layer_state_tensors(int32_t il) const {
+    return layer_state_tensors(il, nullptr);
+}
+
+std::vector<ggml_tensor *> llama_memory_recurrent::layer_state_tensors(int32_t il, ggml_backend_dev_t dev) const {
     if (il < 0 || (size_t) il >= r_l.size() || !r_l[il] || !s_l[il]) {
         return {};
     }
 
-    std::vector<ggml_tensor *> result = { r_l[il], s_l[il] };
-    if (p_l[il]) {
-        result.push_back(p_l[il]);
+    const auto active_dev = ggml_backend_buft_get_device(layer_storages[il]->buft);
+    const auto bank_it = dev ? layer_banks.at(il).find(dev) : layer_banks.at(il).end();
+    const auto * bank = !dev || dev == active_dev || bank_it == layer_banks.at(il).end() ? nullptr : &bank_it->second;
+    auto * r = bank ? bank->r : r_l[il];
+    auto * s = bank ? bank->s : s_l[il];
+    auto * p = bank ? bank->p : p_l[il];
+    std::vector<ggml_tensor *> result = { r, s };
+    if (p) {
+        result.push_back(p);
     }
     return result;
+}
+
+llama_memory_recurrent::metadata_ptr llama_memory_recurrent::get_active_metadata() const {
+    return active_metadata;
+}
+
+llama_memory_recurrent::metadata_ptr llama_memory_recurrent::clone_active_metadata() const {
+    return std::make_shared<metadata>(*active_metadata);
 }
 
 llama_memory_layer_move_ptr llama_memory_recurrent::prepare_layer_move(int32_t il, ggml_backend_dev_t dev) {
@@ -225,45 +319,53 @@ llama_memory_layer_move_ptr llama_memory_recurrent::prepare_layer_move(int32_t i
     const auto * r_src = r_l[il];
     const auto * s_src = s_l[il];
     const auto * p_src = p_l[il];
-    auto storage = std::make_shared<layer_storage>();
-    ggml_init_params params = {
-        /*.mem_size   =*/ size_t(3u*ggml_tensor_overhead()),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    storage->ctx.reset(ggml_init(params));
-    storage->buft = ggml_backend_dev_buffer_type(dev);
-    if (!storage->ctx || !storage->buft) {
-        throw std::runtime_error("failed to create recurrent cache layer destination");
+    auto & banks = layer_banks[il];
+    auto bank = banks.find(dev);
+    if (bank == banks.end()) {
+        auto storage = std::make_shared<layer_storage>();
+        ggml_init_params params = {
+            /*.mem_size   =*/ size_t(3u*ggml_tensor_overhead()),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        storage->ctx.reset(ggml_init(params));
+        storage->buft = ggml_backend_dev_buffer_type(dev);
+        if (!storage->ctx || !storage->buft) {
+            throw std::runtime_error("failed to create recurrent cache layer destination");
+        }
+
+        auto * ctx = storage->ctx.get();
+        auto * r_dst = ggml_dup_tensor(ctx, r_src);
+        auto * s_dst = ggml_dup_tensor(ctx, s_src);
+        memcpy(r_dst->nb, r_src->nb, sizeof(r_dst->nb));
+        memcpy(s_dst->nb, s_src->nb, sizeof(s_dst->nb));
+        ggml_set_name(r_dst, ggml_get_name(r_src));
+        ggml_set_name(s_dst, ggml_get_name(s_src));
+
+        ggml_tensor * p_dst = nullptr;
+        if (p_src) {
+            p_dst = ggml_dup_tensor(ctx, p_src);
+            memcpy(p_dst->nb, p_src->nb, sizeof(p_dst->nb));
+            ggml_set_name(p_dst, ggml_get_name(p_src));
+        }
+
+        storage->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, storage->buft));
+        if (!storage->buf) {
+            throw std::runtime_error("failed to allocate recurrent cache layer destination");
+        }
+        ggml_backend_buffer_clear(storage->buf.get(), 0);
+
+        bank = banks.emplace(dev, layer_bank { r_dst, s_dst, p_dst, std::move(storage) }).first;
     }
 
-    auto * ctx = storage->ctx.get();
-    auto * r_dst = ggml_dup_tensor(ctx, r_src);
-    auto * s_dst = ggml_dup_tensor(ctx, s_src);
-    memcpy(r_dst->nb, r_src->nb, sizeof(r_dst->nb));
-    memcpy(s_dst->nb, s_src->nb, sizeof(s_dst->nb));
-    ggml_set_name(r_dst, ggml_get_name(r_src));
-    ggml_set_name(s_dst, ggml_get_name(s_src));
-
-    ggml_tensor * p_dst = nullptr;
-    if (p_src) {
-        p_dst = ggml_dup_tensor(ctx, p_src);
-        memcpy(p_dst->nb, p_src->nb, sizeof(p_dst->nb));
-        ggml_set_name(p_dst, ggml_get_name(p_src));
+    const auto & dst = bank->second;
+    if (dst.r == r_src) {
+        throw std::invalid_argument("recurrent cache layer destination is already active");
     }
 
-    storage->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, storage->buft));
-    if (!storage->buf) {
-        throw std::runtime_error("failed to allocate recurrent cache layer destination");
-    }
+    const size_t bytes = ggml_nbytes(r_src) + ggml_nbytes(s_src) + (p_src ? ggml_nbytes(p_src) : 0);
 
-    ggml_backend_tensor_copy(r_src, r_dst);
-    ggml_backend_tensor_copy(s_src, s_dst);
-    if (p_src) {
-        ggml_backend_tensor_copy(p_src, p_dst);
-    }
-
-    return std::make_unique<layer_move>(*this, il, r_dst, s_dst, p_dst, std::move(storage));
+    return std::make_unique<layer_move>(*this, il, dst.r, dst.s, dst.p, dst.storage, bytes, 0);
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -556,8 +658,9 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     if (independent_layers) {
-        for (const auto & storage : layer_storages) {
-            if (storage) {
+        for (const auto & banks : layer_banks) {
+            for (const auto & entry : banks) {
+                const auto & storage = entry.second.storage;
                 ret[ggml_backend_buffer_get_type(storage->buf.get())] += ggml_backend_buffer_get_size(storage->buf.get());
             }
         }
@@ -624,6 +727,14 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
 }
 
 bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
+    return prepare(*active_metadata, ubatches);
+}
+
+bool llama_memory_recurrent::prepare(metadata & metadata, const std::vector<llama_ubatch> & ubatches) {
+    auto & cells = metadata.cells;
+    auto & used = metadata.used;
+    auto & head = metadata.head;
+
     // simply remember the full state because it is very small for this type of cache
     // TODO: optimize
     auto org_cells = cells;
@@ -633,7 +744,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
-        if (!find_slot(ubatch)) {
+        if (!find_slot(metadata, ubatch)) {
             success = false;
             break;
         }
@@ -648,6 +759,16 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+    return find_slot(*active_metadata, ubatch);
+}
+
+bool llama_memory_recurrent::find_slot(metadata & metadata, const llama_ubatch & ubatch) {
+    auto & head = metadata.head;
+    auto & used = metadata.used;
+    auto & n = metadata.n;
+    auto & rs_z = metadata.rs_z;
+    auto & cells = metadata.cells;
+
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
@@ -866,9 +987,9 @@ bool llama_memory_recurrent::get_can_shift() const {
 size_t llama_memory_recurrent::total_size() const {
     size_t size = 0;
     if (independent_layers) {
-        for (const auto & storage : layer_storages) {
-            if (storage) {
-                size += ggml_backend_buffer_get_size(storage->buf.get());
+        for (const auto & banks : layer_banks) {
+            for (const auto & entry : banks) {
+                size += ggml_backend_buffer_get_size(entry.second.storage->buf.get());
             }
         }
         return size;
@@ -1384,12 +1505,27 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 llama_memory_recurrent_context::llama_memory_recurrent_context(llama_memory_status status) : status(status) {}
 
 llama_memory_recurrent_context::llama_memory_recurrent_context(
-        llama_memory_recurrent * mem) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), is_full(true) {
+        llama_memory_recurrent * mem) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), metadata(mem->get_active_metadata()), is_full(true) {
 }
 
 llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
+        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), metadata(mem->get_active_metadata()), ubatches(std::move(ubatches)) {}
+
+llama_memory_recurrent_context::llama_memory_recurrent_context(
+        llama_memory_recurrent * mem,
+        llama_memory_recurrent::metadata_ptr metadata,
+        std::vector<llama_ubatch> ubatches,
+        std::vector<ggml_backend_dev_t> layer_devices) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), metadata(std::move(metadata)), layer_devices(std::move(layer_devices)), ubatches(std::move(ubatches)) {
+    GGML_ASSERT(this->metadata);
+}
+
+llama_memory_recurrent_context::llama_memory_recurrent_context(
+        llama_memory_recurrent * mem,
+        llama_memory_recurrent::metadata_ptr metadata,
+        std::vector<ggml_backend_dev_t> layer_devices) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), metadata(std::move(metadata)), layer_devices(std::move(layer_devices)), is_full(true) {
+    GGML_ASSERT(this->metadata);
+}
 
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
@@ -1414,7 +1550,7 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    mem->find_slot(*metadata, ubatches[i_next]);
 
     return true;
 }
@@ -1430,15 +1566,15 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
-    return is_full ? mem->size : mem->n;
+    return is_full ? mem->size : metadata->n;
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
-    return is_full ? 0 : mem->head;
+    return is_full ? 0 : metadata->head;
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
-    return is_full ? 0 : mem->rs_z;
+    return is_full ? 0 : metadata->rs_z;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {
@@ -1446,32 +1582,50 @@ uint32_t llama_memory_recurrent_context::get_size() const {
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
-    return mem->r_l[il];
+    if (layer_devices.empty()) {
+        return mem->r_l[il];
+    }
+    const auto dev = layer_devices.at(il);
+    const auto active_dev = ggml_backend_buft_get_device(mem->layer_storages[il]->buft);
+    const auto bank = mem->layer_banks.at(il).find(dev);
+    return dev == active_dev || bank == mem->layer_banks.at(il).end() ? mem->r_l[il] : bank->second.r;
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
-    return mem->s_l[il];
+    if (layer_devices.empty()) {
+        return mem->s_l[il];
+    }
+    const auto dev = layer_devices.at(il);
+    const auto active_dev = ggml_backend_buft_get_device(mem->layer_storages[il]->buft);
+    const auto bank = mem->layer_banks.at(il).find(dev);
+    return dev == active_dev || bank == mem->layer_banks.at(il).end() ? mem->s_l[il] : bank->second.s;
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
-    return mem->p_l[il];
+    if (layer_devices.empty()) {
+        return mem->p_l[il];
+    }
+    const auto dev = layer_devices.at(il);
+    const auto active_dev = ggml_backend_buft_get_device(mem->layer_storages[il]->buft);
+    const auto bank = mem->layer_banks.at(il).find(dev);
+    return dev == active_dev || bank == mem->layer_banks.at(il).end() ? mem->p_l[il] : bank->second.p;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
-    const uint32_t cell_idx = i + mem->head;
-    const int32_t  src0     = mem->cells[cell_idx].src0;
+    const uint32_t cell_idx = i + metadata->head;
+    const int32_t  src0     = metadata->cells[cell_idx].src0;
 
     if (mem->n_rs_seq == 0) {
         return src0;
     }
 
     uint32_t idx = 0;
-    if (!mem->cells[cell_idx].seq_id.empty()) {
-        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
-        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
-            idx = mem->rs_idx[seq];
+    if (!metadata->cells[cell_idx].seq_id.empty()) {
+        const llama_seq_id seq = *metadata->cells[cell_idx].seq_id.begin();
+        if (seq >= 0 && (size_t) seq < metadata->rs_idx.size()) {
+            idx = metadata->rs_idx[seq];
             // reset rollback idx
-            mem->rs_idx[seq] = 0;
+            metadata->rs_idx[seq] = 0;
         }
     }
     return (int32_t)(idx * mem->size) + src0;

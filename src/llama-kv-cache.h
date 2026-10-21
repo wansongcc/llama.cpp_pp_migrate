@@ -29,6 +29,15 @@ public:
         std::vector<uint32_t> sdst;
     };
 
+    struct metadata {
+        std::vector<uint32_t> v_heads;
+        std::shared_ptr<llama_kv_cells_vec> v_cells;
+        std::vector<uint32_t> seq_to_stream;
+        stream_copy_info sc_info;
+    };
+
+    using metadata_ptr = std::shared_ptr<metadata>;
+
     // for each ubatch, create a slot_info that contains information about where the ubatch should be inserted in the
     //   KV cells. for example, cell indices for each token, such that: token[i] -> goes to cells[idxs[i]]
     struct slot_info {
@@ -138,6 +147,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm  (metadata & metadata, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -168,8 +178,12 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    metadata_ptr get_active_metadata() const;
+    metadata_ptr clone_active_metadata() const;
+
     llama_memory_layer_move_ptr prepare_layer_move(int32_t il, ggml_backend_dev_t dev);
     std::vector<ggml_tensor *> layer_state_tensors(int32_t il) const;
+    std::vector<ggml_tensor *> layer_state_tensors(int32_t il, ggml_backend_dev_t dev) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -189,14 +203,19 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv(const metadata & metadata, const slot_info & sinfo) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_backend_dev_t dev) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_backend_dev_t dev) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, ggml_backend_dev_t dev) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, ggml_backend_dev_t dev) const;
 
     //
     // preparation API
@@ -205,6 +224,7 @@ public:
     // find places for the provided ubatches in the cache, returns the slot infos
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
+    slot_info_vec_t prepare(metadata & metadata, const std::vector<llama_ubatch> & ubatches);
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
@@ -212,9 +232,11 @@ public:
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
+    slot_info find_slot(const metadata & metadata, const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void apply_ubatch(metadata & metadata, const slot_info & sinfo, const llama_ubatch & ubatch);
 
     //
     // input API
@@ -230,9 +252,12 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+    void set_input_k_shift(const metadata & metadata, ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kq_mask   (const metadata & metadata, ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_pos_bucket(const metadata & metadata, ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -247,6 +272,7 @@ public:
     //   prev, n=2: A -> [NULL, NULL], B -> [NULL, A], 3rd X -> [X, X], C -> [X, X]
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+    void get_prev_tokens(const metadata & metadata, const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     struct layer_storage {
@@ -308,24 +334,23 @@ private:
 
     const bool independent_layers = false;
 
-    // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
-    // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
-    std::vector<uint32_t> v_heads;
-
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
-    std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
+    metadata_ptr active_metadata;
 
+    // Active-view aliases used by the existing cache API. Candidate contexts
+    // access their metadata view directly and never replace this object.
+    std::vector<uint32_t> & v_heads;
     llama_kv_cells_vec & v_cells;
-
-    // maps from a sequence id to a stream id
-    std::vector<uint32_t> seq_to_stream;
-
-    // pending stream copies that will be applied during the next update
-    stream_copy_info sc_info;
+    std::vector<uint32_t> & seq_to_stream;
+    stream_copy_info & sc_info;
 
     std::vector<kv_layer> layers;
+
+    std::vector<std::unordered_map<ggml_backend_dev_t, kv_layer>> layer_banks;
+
+    const kv_layer & layer_for_device(int32_t ikv, ggml_backend_dev_t dev) const;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -390,6 +415,18 @@ public:
             slot_info_vec_t sinfos,
             std::vector<llama_ubatch> ubatches);
 
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            llama_kv_cache::metadata_ptr metadata,
+            slot_info_vec_t sinfos,
+            std::vector<llama_ubatch> ubatches,
+            std::vector<ggml_backend_dev_t> layer_devices = {});
+
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            llama_kv_cache::metadata_ptr metadata,
+            std::vector<ggml_backend_dev_t> layer_devices);
+
     virtual ~llama_kv_cache_context();
 
     //
@@ -450,6 +487,8 @@ private:
     llama_memory_status status;
 
     llama_kv_cache * kv;
+    llama_kv_cache::metadata_ptr metadata;
+    std::vector<ggml_backend_dev_t> layer_devices;
     llama_context * lctx;
 
     //

@@ -213,17 +213,27 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = params.replay_end < 0 ? build_inp_embd(model.tok_embd) : build_inp_hidden();
     cb(inpL, "model.embed_tokens", -1);
 
     auto * inp = build_inp_mem_hybrid();
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    const int first = params.replay_first;
+    const int end = params.replay_end < 0 ? n_layer : params.replay_end;
+    bool has_attn = false;
+    for (int il = first; il < end; ++il) {
+        has_attn |= !hparams.is_recr(il);
+    }
+    ggml_tensor * inp_pos     = has_attn ? build_inp_pos() : nullptr;
+    ggml_tensor * inp_out_ids = params.replay_end < 0 ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = first; il < end; ++il) {
         res->t_layer_inp[il] = inpL;
+        if (params.capture_layer == il) {
+            res->t_layer_inp[il] = ggml_dup(ctx0, inpL);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
 
         ggml_tensor * inpSA = inpL;
 
@@ -272,6 +282,12 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = cur;
     }
     cur = inpL;
+
+    if (params.replay_end >= 0) {
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // post-norm hidden state is input to both the LM head and the MTP head
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

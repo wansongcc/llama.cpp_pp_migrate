@@ -138,6 +138,13 @@ public:
     const int64_t n_embd = 0;
 };
 
+class llm_graph_input_hidden : public llm_graph_input_i {
+public:
+    ggml_tensor * hidden = nullptr;
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
@@ -813,10 +820,16 @@ struct llm_graph_params {
 
     const std::vector<const llama_layer *> * active_layers = nullptr;
     uint64_t placement_epoch = 0;
+    int32_t replay_first = 0;
+    int32_t replay_end = -1;
+    int32_t capture_layer = -1;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (replay_first != other.replay_first || replay_end != other.replay_end || capture_layer != other.capture_layer) {
+            return false;
+        }
         if (placement_epoch != other.placement_epoch || active_layers != other.active_layers) {
             return false;
         }
@@ -1168,6 +1181,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_hidden() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

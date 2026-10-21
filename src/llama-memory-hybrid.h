@@ -18,6 +18,17 @@
 
 class llama_memory_hybrid : public llama_memory_i {
 public:
+    struct execution_view {
+        llama_kv_cache::metadata_ptr attn;
+        llama_memory_recurrent::metadata_ptr recurrent;
+        std::vector<ggml_backend_dev_t> layer_devices;
+        uint64_t frontier = 0;
+        uint64_t generation = 0;
+        bool append_only = true;
+    };
+
+    using execution_view_ptr = std::shared_ptr<execution_view>;
+
     llama_memory_hybrid(
         const llama_model & model,
                             /* attn */
@@ -54,6 +65,12 @@ public:
             uint32_t n_ubatch,
             bool embd_all) override;
 
+    llama_memory_context_ptr init_batch(
+            const execution_view_ptr & view,
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            bool embd_all);
+
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
@@ -80,7 +97,17 @@ public:
 
     llama_memory_layer_move_ptr prepare_layer_move(int32_t il, ggml_backend_dev_t dev);
     std::vector<ggml_tensor *> layer_state_tensors(int32_t il) const;
+    std::vector<ggml_tensor *> layer_state_tensors(const execution_view_ptr & view, int32_t il) const;
     bool is_append_only() const;
+    execution_view_ptr get_active_view() const;
+    execution_view_ptr clone_active_view() const;
+    execution_view_ptr clone_active_view(const std::vector<ggml_backend_dev_t> & layer_devices) const;
+    void exchange_active_view(const execution_view_ptr & candidate, uint64_t expected_frontier);
+
+    llama_memory_context_ptr init_full(const execution_view_ptr & view);
+    llama_memory_context_ptr init_ubatches(
+            const execution_view_ptr & view,
+            std::vector<llama_ubatch> ubatches);
 
     //
     // llama_memory_hybrid specific API
@@ -96,7 +123,7 @@ private:
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 
     const bool independent_layers;
-    bool append_only = true;
+    const execution_view_ptr active_view;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -109,6 +136,10 @@ public:
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
 
+    llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+              llama_memory_hybrid::execution_view_ptr view);
+
     // init update
     explicit llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
@@ -118,6 +149,12 @@ public:
     // init success
     llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
+                  slot_info_vec_t   sinfos_attn,
+        std::vector<llama_ubatch>   ubatches);
+
+    llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+              llama_memory_hybrid::execution_view_ptr view,
                   slot_info_vec_t   sinfos_attn,
         std::vector<llama_ubatch>   ubatches);
 
@@ -141,6 +178,8 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    llama_memory_hybrid::execution_view_ptr view;
 
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;

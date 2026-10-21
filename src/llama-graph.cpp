@@ -91,6 +91,15 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_hidden::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->embd);
+    ggml_backend_tensor_set(hidden, ubatch->embd, 0, ggml_nbytes(hidden));
+}
+
+bool llm_graph_input_hidden::can_reuse(const llm_graph_params & params) {
+    return params.ubatch.embd && hidden->ne[1] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1084,22 +1093,24 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    if (inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    if (inp_attn->self_k_rot) {
-        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-    }
+        if (inp_attn->self_k_rot) {
+            mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+        }
 
-    if (inp_attn->self_v_rot) {
-        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        if (inp_attn->self_v_rot) {
+            mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1358,6 +1369,10 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
+    if (params.capture_layer >= 0) {
+        GGML_ASSERT(t_layer_inp[params.capture_layer]);
+        ggml_set_output(t_layer_inp[params.capture_layer]);
+    }
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
@@ -1373,7 +1388,7 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
-            if (embeddings_layer_inp[il]) {
+            if (embeddings_layer_inp[il] && params.replay_end < 0) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }
@@ -2313,6 +2328,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 }
 
 // input embeddings with optional lora
+ggml_tensor * llm_graph_context::build_inp_hidden() const {
+    auto inp = std::make_unique<llm_graph_input_hidden>();
+    inp->hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(inp->hidden);
+    cb(inp->hidden, "inp_embd", -1);
+    auto * hidden = inp->hidden;
+    res->add_input(std::move(inp));
+    return hidden;
+}
+
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
